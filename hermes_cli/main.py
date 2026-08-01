@@ -317,6 +317,7 @@ from hermes_cli.subcommands.sync import build_sync_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
 from hermes_cli.subcommands.model import build_model_parser
+from hermes_cli.subcommands.subagent import build_subagent_parser
 from hermes_cli.subcommands.setup import build_setup_parser
 
 from hermes_cli.subcommands.whatsapp import build_whatsapp_parser, build_whatsapp_cloud_parser
@@ -1794,6 +1795,7 @@ cmd_plugins = _forward_command("cmd_plugins", "hermes_cli.plugins_cmd", "plugins
 cmd_mcp = _forward_command("cmd_mcp", "hermes_cli.mcp_config", "mcp_command")
 cmd_claw = _forward_command("cmd_claw", "hermes_cli.claw", "claw_command")
 cmd_import_agent = _forward_command("cmd_import_agent", "hermes_cli.agent_import", "import_agent_command")
+cmd_subagent = _forward_command("cmd_subagent", "hermes_cli.subcommands.subagent", "cmd_subagent", forward_return=True)
 
 
 def cmd_model(args):
@@ -1926,7 +1928,7 @@ def _pick_provider(config, active, provider_labels, custom_provider_map):
     return None if member_idx is None else selected_members[member_idx]
 
 
-def select_provider_and_model(args=None):
+def select_provider_and_model(args=None, *, initial_model=None, initial_provider=None):
     """Core provider selection + model picking logic.
 
     Shared by ``cmd_model`` (``hermes model``) and the setup wizard
@@ -1939,16 +1941,19 @@ def select_provider_and_model(args=None):
     config = load_config()
     model_cfg = config.get("model")
     current_model = model_cfg.get("default", "") if isinstance(model_cfg, dict) else model_cfg
-    current_model = current_model or "(not set)"
+    initial_model_cursor = str(initial_model or "").strip()
+    current_model = initial_model_cursor or current_model or "(not set)"
 
     # Effective provider the same way the CLI resolves it at startup:
     # config.yaml model.provider > env var > auto-detect
     config_provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
-    effective_provider = config_provider or os.getenv("HERMES_INFERENCE_PROVIDER") or "auto"
+    effective_provider = str(initial_provider or "").strip() or config_provider or os.getenv("HERMES_INFERENCE_PROVIDER") or "auto"
 
     # User-defined custom providers from config.yaml: key → {name, base_url, api_key}
     _custom_provider_map = _named_custom_provider_map(config)
     active = _resolve_active_provider(config, model_cfg, effective_provider, _custom_provider_map)
+    if initial_model_cursor and active in _custom_provider_map:
+        _custom_provider_map[active] = {**_custom_provider_map[active], "model": initial_model_cursor}
 
     from hermes_cli.models import _PROVIDER_LABELS
 
@@ -1988,6 +1993,8 @@ def select_provider_and_model(args=None):
                 "It may have been removed from config.yaml. No change."
             )
             return
+        if initial_model_cursor and selected_provider == active:
+            provider_info = {**provider_info, "model": initial_model_cursor}
         _model_flow_named_custom(config, provider_info)
     elif selected_provider == "remove-custom":
         _remove_custom_provider(config)
@@ -2604,7 +2611,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "project", "proxy",
         "prompt-size",
         "resume",
-        "send", "sessions", "setup",
+        "send", "sessions", "setup", "subagent",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
@@ -3163,6 +3170,7 @@ def _build_cli_parser():
     chat_parser.set_defaults(func=cmd_chat)
 
     build_model_parser(subparsers, cmd_model=cmd_model)
+    build_subagent_parser(subparsers, cmd_subagent=cmd_subagent)
     build_moa_parser(subparsers)
     build_fallback_parser(subparsers)
     build_worktree_parser(subparsers)

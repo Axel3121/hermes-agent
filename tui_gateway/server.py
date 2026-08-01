@@ -3099,7 +3099,8 @@ def _finish_reload(rid, params: dict, *, coalesced: bool) -> dict:
     return _ok(rid, {"status": "reloaded", "loaded_rev": _mcp_reload_loaded_rev, **({"coalesced": True} if coalesced else {})})
 
 
-_TUI_HIDDEN: frozenset[str] = frozenset({"sethome", "set-home", "commands", "approve", "deny"})
+_TUI_HIDDEN: frozenset[str] = frozenset({"sethome", "set-home", "commands", "approve", "deny", "subagent"})
+_TUI_EXEC_BLOCKED: frozenset[str] = frozenset({"subagent"})
 
 _TUI_EXTRA: list[tuple[str, str, str]] = [
     ("/density", "Toggle compact display mode", "TUI"),
@@ -3159,6 +3160,7 @@ def _rank_slash_completions(items: list[dict], usage, origin_of, *, browsing: bo
 
 # argv shapes that must not run headless in the gateway process → user hint.
 _CLI_EXEC_BLOCKED = {
+    ("subagent",): "`hermes subagent` is CLI-only — run it in another terminal",
     ("setup",): "`hermes setup` needs a full terminal — run it outside the TUI",
     ("gateway",): "`hermes gateway` is long-running — run it in another terminal",
     ("sessions", "browse"): "`hermes sessions browse` is interactive — use /resume here, or run browse in another terminal",

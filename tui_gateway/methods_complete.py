@@ -245,7 +245,8 @@ def _(rid, params: dict) -> dict:
                 "text": c.text, "display": to_plain_text(c.display) if c.display else c.text,
                 "meta": to_plain_text(c.display_meta) if c.display_meta else "",
                 "kind": "skill" if c.text.strip().lstrip("/").lower() in skill_names else "command"}
-            for c in completer.get_completions(doc, None)]
+            for c in completer.get_completions(doc, None)
+            if c.text.strip().lstrip("/").split(" ", 1)[0].lower() not in _TUI_EXEC_BLOCKED]
     items = to_items(Document(text, len(text)))
     # Rank + bound while a `/token` is under the cursor (the one stage skills are
     # offered at); an argument stage (`/personality `) keeps its command's order.

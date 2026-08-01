@@ -352,6 +352,8 @@ class _Catalog:
 def _catalog_registry(cat: _Catalog) -> None:
     commands = _tools_mod("hermes_cli.commands")
     for cmd in commands.COMMAND_REGISTRY:
+        if cmd.name in _TUI_EXEC_BLOCKED:
+            continue
         meta = commands.command_desktop_meta(cmd)
         cat.commands.update({f"/{key}": dict(meta) for key in (cmd.name, *cmd.aliases)})
         if cmd.name in _TUI_HIDDEN or cmd.gateway_only:
@@ -424,7 +426,8 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         warning = f"skill discovery unavailable: {e}"
     return _ok(rid, {
-        "pairs": cat.pairs, "sub": {k: v[:] for k, v in _tools_mod("hermes_cli.commands").SUBCOMMANDS.items()},
+        "pairs": cat.pairs, "sub": {k: v[:] for k, v in _tools_mod("hermes_cli.commands").SUBCOMMANDS.items()
+                                  if k.lstrip("/").lower() not in _TUI_EXEC_BLOCKED},
         "canon": cat.canon,
         "commands": cat.commands,
         "categories": [{"name": c, "pairs": rows} for c, rows in cat.cat_map.items()],
@@ -453,7 +456,7 @@ def _(rid, params: dict) -> dict:
 @_rpc("command.resolve", 5012)
 def _(rid, params: dict) -> dict:
     r = _tools_mod("hermes_cli.commands").resolve_command(params.get("name", ""))
-    if r:
+    if r and r.name not in _TUI_EXEC_BLOCKED:
         return _ok(rid, {"canonical": r.name, "description": r.description, "category": r.category})
     return _err(rid, 4011, f"unknown command: {params.get('name')}")
 
@@ -814,6 +817,8 @@ _SLASH_BUILTINS = {
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
     name, arg = _resolve_name(params.get("name", "").lstrip("/")), params.get("arg", "")
+    if name.lower() in _TUI_EXEC_BLOCKED:
+        return _err(rid, 4011, f"unknown command: {name}")
     session = _sessions.get(params.get("session_id", ""))
 
     # Stage order is load-bearing: quick > plugin > bundle > skill > built-in.
@@ -837,6 +842,8 @@ def _(rid, params: dict) -> dict:
     # commands also bypass it but return normal slash.exec output (TUI keeps the pager path).
     parts = cmd.lstrip("/").split(maxsplit=1)
     base = (parts[0] if parts else "").lower()
+    if _resolve_name(base) in _TUI_EXEC_BLOCKED:
+        return _err(rid, 4003, f"command not available in TUI: /{base}")
     arg = parts[1] if len(parts) > 1 else ""
     sid = params.get("session_id", "")
     live_output = _live_slash_command_output(sid, session, base, arg)

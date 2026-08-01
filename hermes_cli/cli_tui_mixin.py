@@ -616,8 +616,9 @@ class CLITuiMixin:
         state = self._model_picker_state
         if not state:
             return []
+        target_label = "Subagent Model" if state.get("target") == "subagent" else "Model"
         if state.get("stage", "provider") == "provider":
-            title = "⚙ Model Picker — Select Provider"
+            title = f"⚙ {target_label} Picker — Select Provider"
             choices = []
             _providers = state.get("providers")
             for p in _providers if isinstance(_providers, list) else []:
@@ -633,7 +634,7 @@ class CLITuiMixin:
         else:
             provider_data = state.get("provider_data") or {}
             model_list = state.get("model_list") or []
-            title = f"⚙ Model Picker — {provider_data.get('name', provider_data.get('slug', 'Provider'))}"
+            title = f"⚙ {target_label} Picker — {provider_data.get('name', provider_data.get('slug', 'Provider'))}"
             # Fuzzy filter narrows the concrete list; selection still resolves to a real entry via
             # the filtered_pairs index mapping, so this never makes model resolution ambiguous.
             _query = state.get("filter", "") or ""

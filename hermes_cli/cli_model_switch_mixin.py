@@ -410,7 +410,7 @@ class CLIModelSwitchMixin:
         else:
             self._console_print(f"[dim]{_escape(msg)}[/dim]")
 
-    def _open_model_picker(self, providers: list, current_model: str, current_provider: str, user_provs=None, custom_provs=None) -> None:
+    def _open_model_picker(self, providers: list, current_model: str, current_provider: str, user_provs=None, custom_provs=None, *, target: str = "main") -> None:
         """Open prompt_toolkit-native /model picker modal."""
         self._capture_modal_input_snapshot()
         self._model_picker_state = {
@@ -421,10 +421,10 @@ class CLIModelSwitchMixin:
             "current_provider": current_provider,
             "user_provs": user_provs,
             "custom_provs": custom_provs,
-            "filter": ""}
+            "filter": "", "target": target}
         self._invalidate(min_interval=0.0)
 
-    def _confirm_expensive_model_switch(self, result) -> bool:
+    def _confirm_expensive_model_switch(self, result, *, target: str = "main") -> bool:
         """Ask for explicit confirmation before applying costly model switches."""
         if not getattr(result, "success", False):
             return True
@@ -438,9 +438,12 @@ class CLIModelSwitchMixin:
             warning = None
         if warning is None:
             return True
-        choices = [
-            ("once", "Switch anyway", "Use this model for the current Hermes session."),
-            ("cancel", "Cancel", "Keep the current model.")]
+        choices = (
+            [("once", "Select anyway", "Use this model for newly spawned subagents."),
+             ("cancel", "Cancel", "Keep the current subagent model override.")]
+            if target == "subagent" else
+            [("once", "Switch anyway", "Use this model for the current Hermes session."),
+             ("cancel", "Cancel", "Keep the current model.")])
         raw = self._prompt_text_input_modal(
             title=f"!!! {warning.title} !!!", detail=warning.message, choices=choices, timeout=120)
         return self._normalize_slash_confirm_choice(raw, choices) == "once"
@@ -631,6 +634,9 @@ class CLIModelSwitchMixin:
             state.update(
                 stage="model", provider_data=provider_data, model_list=model_list,
                 selected=0, filter="", _filtered_pairs=None)
+            if state.get("target") == "subagent" and provider_data.get("slug") == state.get("current_provider"):
+                state["selected"] = next((i for i, mid in enumerate(model_list)
+                                          if mid == state.get("current_model")), 0)
             self._invalidate(min_interval=0.0)
             return
         if stage == "model":
@@ -653,14 +659,21 @@ class CLIModelSwitchMixin:
                 self._close_model_picker()
                 return
             if 0 <= selected < back_idx:
+                picker_target = state.get("target", "main")
+                # Cursor state describes the child; credentials still belong to the
+                # live primary route. Let canonical explicit-provider resolution do
+                # the switch rather than relabeling primary credentials as child-owned.
                 result = _switch_model_from(
-                    self, visible_labels[selected], is_global=persist_global,
+                    self, visible_labels[selected], is_global=persist_global if picker_target == "main" else False,
                     explicit_provider=provider_data.get("slug"),
                     user_providers=state.get("user_provs"),
                     custom_providers=state.get("custom_provs"))
                 # Capture before close — picker state is cleared on close.
                 _picker_custom_provs = state.get("custom_provs")
                 self._close_model_picker()
+                if picker_target == "subagent":
+                    _run_confirm_and_apply(self, self._confirm_and_apply_subagent_model_result, result)
+                    return
                 _run_confirm_and_apply(
                     self, self._confirm_and_apply_model_switch_result,
                     result, persist_global, _picker_custom_provs)
@@ -811,3 +824,149 @@ class CLIModelSwitchMixin:
         self._pending_moa_disable_after_turn = True
         self._pending_agent_seed = payload
         _cprint(f"  MoA one-shot queued with preset {preset}; previous model will be restored after this turn.")
+
+
+    def _confirm_and_apply_subagent_model_result(self, result) -> None:
+        from cli import _cprint
+        try:
+            if not result.success:
+                _cprint(f"  ✗ {result.error_message}")
+                return
+            if not self._confirm_expensive_model_switch(result, target="subagent"):
+                _cprint("  Subagent model selection cancelled.")
+                return
+            from hermes_cli.subagent_model import persist_subagent_switch_result
+
+            status = persist_subagent_switch_result(result)
+            _cprint(f"  ✓ Subagent model: {status.model}")
+            if status.provider:
+                _cprint(f"    Provider: {status.provider}")
+            _cprint("    Saved to config.yaml (delegation.model/provider)")
+        except Exception as exc:
+            _cprint(f"  ✗ Subagent model selection failed: {exc}")
+
+
+
+    def _handle_subagent_command(self, cmd_original: str) -> None:
+        """Handle Classic CLI ``/subagent`` model and reasoning controls."""
+        from cli import _cprint
+        from hermes_cli.model_switch import parse_model_switch_args
+        from hermes_cli.subagent_model import (
+            get_subagent_model_status,
+            get_subagent_reasoning_status,
+            list_subagent_picker_providers,
+            reset_subagent_model,
+            reset_subagent_reasoning_effort,
+            set_subagent_model,
+            set_subagent_reasoning_effort,
+        )
+
+        parts = cmd_original.split(None, 1)
+        raw = parts[1].strip() if len(parts) > 1 else ""
+        if not raw:
+            status = get_subagent_model_status()
+            if status.inherits_parent:
+                model_label = "inherits parent"
+            elif status.model:
+                model_label = f"{status.model} ({status.provider or 'auto'})"
+            else:
+                model_label = f"provider default ({status.provider})"
+            reasoning = get_subagent_reasoning_status()
+            reasoning_label = (
+                "inherits parent" if reasoning.inherits_parent else reasoning.effort
+            )
+            _cprint(f"  Subagent model: {model_label}")
+            _cprint(f"  Subagent reasoning: {reasoning_label}")
+            _cprint(
+                "  Usage: /subagent <model [model|reset] [--provider name] "
+                "| reasoning [effort|reset]>"
+            )
+            return
+
+        verb, _, command_args = raw.partition(" ")
+        if verb.lower() == "reasoning":
+            reasoning_arg = command_args.strip()
+            if not reasoning_arg:
+                status = get_subagent_reasoning_status()
+                label = "inherits parent" if status.inherits_parent else status.effort
+                _cprint(f"  Subagent reasoning: {label}")
+                return
+            if reasoning_arg.lower() in {"reset", "clear", "default", "inherit"}:
+                reset_subagent_reasoning_effort()
+                _cprint("  ✓ Subagent reasoning reset: inherits parent")
+                return
+            try:
+                status = set_subagent_reasoning_effort(reasoning_arg)
+            except ValueError as exc:
+                _cprint(f"  ✗ {exc}")
+                return
+            _cprint(f"  ✓ Subagent reasoning: {status.effort}")
+            _cprint("    Saved to config.yaml (delegation.reasoning_effort)")
+            _cprint("    Applies to newly spawned subagents")
+            return
+
+        if verb.lower() != "model":
+            _cprint(
+                "  Usage: /subagent <model [model|reset] [--provider name] "
+                "| reasoning [effort|reset]>"
+            )
+            return
+
+        model_args = command_args.strip()
+        if model_args.lower() in {"reset", "clear", "default", "inherit"}:
+            reset_subagent_model()
+            _cprint("  ✓ Subagent model reset: inherits parent")
+            return
+
+        parsed = parse_model_switch_args(model_args)
+        if parsed.errors:
+            _cprint(f"  ✗ {parsed.error_messages()[0]}")
+            return
+        if not parsed.target:
+            status = get_subagent_model_status()
+            from hermes_cli.inventory import load_picker_context
+
+            context = load_picker_context()
+            current_provider = (
+                parsed.explicit_provider
+                or status.provider
+                or context.current_provider
+                or "unknown"
+            )
+            current_model = (
+                status.model or context.current_model or "unknown"
+                if not parsed.explicit_provider
+                else (
+                    (status.model or "unknown")
+                    if status.provider == parsed.explicit_provider
+                    else "unknown"
+                )
+            )
+            providers = list_subagent_picker_providers(refresh=parsed.force_refresh)
+            if not providers:
+                _cprint("  No authenticated providers found.")
+                return
+            for row in providers:
+                row["is_current"] = str(row.get("slug") or "") == current_provider
+            self._open_model_picker(
+                providers,
+                current_model,
+                current_provider,
+                user_provs=context.user_providers,
+                custom_provs=context.custom_providers,
+                target="subagent",
+            )
+            return
+
+        try:
+            status = set_subagent_model(
+                parsed.target,
+                provider=parsed.explicit_provider or None,
+            )
+        except ValueError as exc:
+            _cprint(f"  ✗ {exc}")
+            return
+        _cprint(f"  ✓ Subagent model: {status.model}")
+        if status.provider:
+            _cprint(f"    Provider: {status.provider}")
+        _cprint("    Saved to config.yaml (delegation.model/provider)")

@@ -7,11 +7,35 @@ lazily per function so ``hermes_cli.auth.<helper>`` patches still intercept and 
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Callable
 import subprocess
 from typing import Dict, List, Optional
 from hermes_cli.auth_constants import DEFAULT_NOUS_PORTAL_URL
 
 logger = logging.getLogger("hermes_cli.auth")
+
+_MODEL_SELECTION_RECORDER: ContextVar[Optional[Callable[[str], None]]] = ContextVar(
+    "model_selection_recorder", default=None)
+
+
+@contextmanager
+def capture_model_selection(recorder: Callable[[str], None]):
+    """Capture confirmed choices for a secondary target; restore nested captures."""
+    token = _MODEL_SELECTION_RECORDER.set(recorder)
+    try:
+        yield
+    finally:
+        _MODEL_SELECTION_RECORDER.reset(token)
+
+
+def record_model_selection(model_id: str) -> None:
+    """Notify only an active secondary-target capture after a confirmed save."""
+    recorder = _MODEL_SELECTION_RECORDER.get()
+    if recorder is not None:
+        recorder(model_id)
+
 
 _CUSTOM_LABEL = "Enter custom model name"
 _SKIP_LABEL = "Skip (keep current)"
@@ -289,3 +313,4 @@ def _save_model_choice(model_id: str) -> None:
     else:
         config["model"] = {"default": model_id}
     save_config(config)
+    record_model_selection(model_id)

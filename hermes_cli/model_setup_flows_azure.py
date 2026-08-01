@@ -254,6 +254,8 @@ def _model_flow_azure_foundry(config, current_model=""):
     if ctx_len:
         model["context_length"] = ctx_len
     _commit_model_config(cfg)
+    from hermes_cli.auth_model_picker import record_model_selection
+    record_model_selection(effective_model)
     config["model"] = dict(model)
 
     # Clear conflicting env vars so auxiliary clients don't pick up a stale OpenAI base URL / key.
