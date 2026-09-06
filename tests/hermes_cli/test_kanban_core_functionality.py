@@ -1386,6 +1386,123 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
 
 
 
+# ---------------------------------------------------------------------------
+# Dispatcher crash diagnosis — a nonzero-exit crash's error text should carry
+# the REAL reason from the worker's own log, not just "pid N exited with code
+# C", when the log contains a recognizable terminal-failure marker.
+# ---------------------------------------------------------------------------
+
+
+def test_nonzero_crash_extracts_real_reason_from_worker_log(kanban_home):
+    """A nonzero exit whose log has a non-retryable-client-error block gets that
+    reason recorded on the crash — not the bare generic message.
+
+    Regression for the dispatcher mislabeling early client-error crashes: once
+    ``-Q`` is unconditional, this failure mode exits 1 (not 0), so it must land
+    on ``_classify_dead_worker``'s ``nonzero_exit`` branch with a real reason
+    pulled from the worker's own log tail.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="model mismatch", assignee="worker")
+        log_path = _kb.worker_log_path(tid, board=None)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "some banner\n"
+            "⚠️  API call failed (attempt 1/3): BadRequestError [HTTP 400]\n"
+            "   🔌 Provider: openai-codex  Model: claude-sonnet-5\n"
+            "   🌐 Endpoint: https://chatgpt.com/backend-api/codex\n"
+            "   📝 Error: claude-sonnet-5 not supported when using Codex with a ChatGPT account\n"
+            "❌ Non-retryable client error (HTTP 400). Aborting.\n"
+            "   🔌 Provider: openai-codex  Model: claude-sonnet-5\n"
+            "   🌐 Endpoint: https://chatgpt.com/backend-api/codex\n"
+            "\nsession_id: abc123\n",
+            encoding="utf-8",
+        )
+
+        events = _drive_nonzero_crash(conn, tid, 992001)
+        assert events == [tid]
+
+        run = kb.list_runs(conn, tid, include_active=False)[-1]
+        assert "400" in run.error
+        assert "claude-sonnet-5 not supported when using Codex" in run.error
+        assert run.error != f"pid 992001 exited with code 1"
+
+        task = kb.get_task(conn, tid)
+        assert "claude-sonnet-5 not supported when using Codex" in (task.last_failure_error or "")
+    finally:
+        conn.close()
+
+
+def test_nonzero_crash_falls_back_to_generic_message_without_a_marker(kanban_home):
+    """A nonzero exit whose log has no recognizable marker (or no log file at
+    all) keeps the existing generic message — the extraction path must degrade
+    gracefully and never raise, never return empty text.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    conn = kbc.connect()
+    try:
+        # Case 1: log file exists but is unrecognizable garbage.
+        tid1 = kb.create_task(conn, title="garbage log", assignee="worker")
+        log_path = _kb.worker_log_path(tid1, board=None)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("some unrelated banner\nnothing useful here\n", encoding="utf-8")
+        events1 = _drive_nonzero_crash(conn, tid1, 992002)
+        assert events1 == [tid1]
+        run1 = kb.list_runs(conn, tid1, include_active=False)[-1]
+        assert run1.error == "pid 992002 exited with code 1"
+
+        # Case 2: no log file at all.
+        tid2 = kb.create_task(conn, title="missing log", assignee="worker")
+        events2 = _drive_nonzero_crash(conn, tid2, 992003)
+        assert events2 == [tid2]
+        run2 = kb.list_runs(conn, tid2, include_active=False)[-1]
+        assert run2.error == "pid 992003 exited with code 1"
+    finally:
+        conn.close()
+
+
+def test_codex_model_mismatch_refused_before_spawn(kanban_home, monkeypatch):
+    """A task whose ``model_override`` isn't in the openai-codex OAuth allowlist,
+    with ``provider_override`` unset and the assignee's profile pinning
+    ``model.provider: openai-codex``, must be refused BEFORE ``spawn_fn`` is
+    ever called.
+    """
+    from hermes_cli import profiles as _profiles
+
+    profile_dir = _profiles.get_profile_dir("worker")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: claude-sonnet-5\n", encoding="utf-8",
+    )
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="bad override", assignee="worker",
+            model_override="claude-sonnet-5", provider_override=None,
+        )
+
+        spawn_calls = []
+
+        def _fake_spawn(task, workspace, board):
+            spawn_calls.append(task.id)
+            return 12345
+
+        result = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+        assert spawn_calls == [], "spawn_fn must never be called for a doomed codex override"
+        task = kb.get_task(conn, tid)
+        assert task.status in ("ready", "blocked")
+        assert "openai-codex" in (task.last_failure_error or "")
+        assert "claude-sonnet-5" in (task.last_failure_error or "")
+    finally:
+        conn.close()
+
+
 def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
     """A new subscription must NOT replay historical terminal events.
 

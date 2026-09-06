@@ -731,6 +731,92 @@ _PROTOCOL_VIOLATION_ERROR = (
 )
 
 
+# Markers printed by agent/turn_recovery.py's terminal-failure result builders. Reused
+# verbatim, not invented here — see nonretryable_client_error_result / log_api_error_attempt
+# / max_retries_exhausted_result.
+_LOG_FAILURE_REASON_MAX_LEN = 300
+_NONRETRYABLE_RE = re.compile(r"Non-retryable client error \(HTTP (\d+)\)\. Aborting\.")
+_PROVIDER_MODEL_RE = re.compile(r"Provider:\s*(\S+)\s+Model:\s*(\S+)")
+_ERROR_DETAIL_RE = re.compile(r"📝 Error:\s*(.+)")
+_RETRY_EXHAUSTED_RE = re.compile(r"API call failed after \d+ retries:?\s*(.*)")
+_RESUME_FOOTER_RE = re.compile(r"Resume this session with:")
+
+
+def _extract_failure_reason_from_log_text(log_text: Optional[str]) -> Optional[str]:
+    """Best-effort real failure reason from a worker's own log tail.
+
+    Never raises; returns ``None`` when nothing recognizable is found so the caller keeps
+    the existing generic ``"pid N exited with code C"`` message. Preference order: (1) the
+    LAST non-retryable client error block (HTTP code + provider/model + detail line, all
+    printed by ``agent/turn_recovery.py``), (2) the last retry-exhaustion terminal line,
+    (3) the last non-empty line before the "Resume this session with:" footer.
+    """
+    if not log_text:
+        return None
+    try:
+        lines = log_text.splitlines()
+
+        for i in range(len(lines) - 1, -1, -1):
+            m = _NONRETRYABLE_RE.search(lines[i])
+            if not m:
+                continue
+            code = m.group(1)
+            window = lines[max(0, i - 6): i + 4]
+            provider = model = detail = None
+            for wline in window:
+                pm = _PROVIDER_MODEL_RE.search(wline)
+                if pm:
+                    provider, model = pm.group(1), pm.group(2)
+                dm = _ERROR_DETAIL_RE.search(wline)
+                if dm:
+                    detail = dm.group(1).strip()
+            reason = f"Non-retryable client error (HTTP {code})"
+            if provider or model:
+                reason += f" [provider={provider} model={model}]"
+            if detail:
+                reason += f": {detail}"
+            return reason[:_LOG_FAILURE_REASON_MAX_LEN]
+
+        for i in range(len(lines) - 1, -1, -1):
+            m = _RETRY_EXHAUSTED_RE.search(lines[i])
+            if m:
+                detail = m.group(1).strip()
+                reason = f"API call failed after retries: {detail}" if detail else lines[i].strip()
+                return reason[:_LOG_FAILURE_REASON_MAX_LEN]
+
+        footer_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if _RESUME_FOOTER_RE.search(lines[i]):
+                footer_idx = i
+                break
+        if footer_idx is None:
+            # No recognizable Hermes worker-log shape at all — degrade to the
+            # generic "pid N exited with code C" message rather than guessing.
+            return None
+        for i in range(footer_idx - 1, -1, -1):
+            line = lines[i].strip()
+            if line:
+                return line[:_LOG_FAILURE_REASON_MAX_LEN]
+        return None
+    except Exception:
+        return None
+
+
+_WORKER_LOG_TAIL_BYTES = 8192
+
+
+def _extract_worker_log_failure_reason(task_id: str, board: Optional[str]) -> Optional[str]:
+    """Thin wrapper: read the worker's own log tail and extract a real failure reason.
+
+    Never raises — a failed log read must never break crash classification.
+    """
+    try:
+        log_text = _kb.read_worker_log(task_id, tail_bytes=_WORKER_LOG_TAIL_BYTES, board=board)
+    except Exception:
+        return None
+    return _extract_failure_reason_from_log_text(log_text)
+
+
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -750,8 +836,15 @@ class _DeadWorker:
         return "rate_limited" if self.rate_limited else "crashed"
 
 
-def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
-    """Map a dead worker's reaped exit status to its reclaim bookkeeping."""
+def _classify_dead_worker(
+    pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
+) -> _DeadWorker:
+    """Map a dead worker's reaped exit status to its reclaim bookkeeping.
+
+    ``task_id``/``board`` let ``nonzero_exit``/``signaled`` crashes pull the real failure
+    reason out of the worker's own log tail; omitted (or a failed read) falls back to the
+    generic ``"pid N exited with code C"`` message unchanged.
+    """
     kind, code = _classify_worker_exit(pid)
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
@@ -777,8 +870,16 @@ def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
         )
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
+        if task_id is not None:
+            reason = _extract_worker_log_failure_reason(task_id, board)
+            if reason:
+                error_text = f"{error_text}: {reason}"
     elif kind == "signaled":
         error_text = f"pid {pid} killed by signal {code}"
+        if task_id is not None:
+            reason = _extract_worker_log_failure_reason(task_id, board)
+            if reason:
+                error_text = f"{error_text}: {reason}"
     else:
         error_text = f"pid {pid} not alive"
     event_payload = {"pid": pid, "claimer": claimer}
@@ -802,7 +903,7 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
-def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
+def _reclaim_dead_workers(conn: sqlite3.Connection, *, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
@@ -825,7 +926,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
                 continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"])
+            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -934,7 +1035,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(conn: sqlite3.Connection, *, board: Optional[str] = None) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -943,8 +1044,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
     wall, released WITHOUT counting a failure and surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
+
+    ``board`` (when known) lets ``nonzero_exit``/``signaled`` crashes read the
+    worker's own log tail to extract a real failure reason.
     """
-    sweep = _reclaim_dead_workers(conn)
+    sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
@@ -1487,6 +1591,52 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _resolve_task_codex_mismatch(task: Task) -> Optional[str]:
+    """Clear error string, or ``None``, for a doomed ``model_override`` on an
+    ``openai-codex`` profile.
+
+    Narrowly scoped and offline: refuses to spawn ONLY when the task's
+    ``model_override`` is set, ``provider_override`` is NOT, and the
+    assignee's profile ``config.yaml`` EXPLICITLY pins ``model.provider:
+    openai-codex`` — the one provider with a small, curated, offline,
+    structurally-enforced model allowlist (``hermes_cli.codex_models``). This
+    is what would have caught ``claude-sonnet-5`` before wasting 3 spawns.
+
+    Deliberately does NOT chase ``model.provider: auto`` / env-var / custom-
+    provider resolution: the effective provider then depends on the full
+    startup chain in ``hermes_cli.main._resolve_active_provider`` (env vars,
+    OAuth/API-key presence, custom-provider base-url matching) which is
+    tightly coupled to the ACTIVE profile's process state, not a pure offline
+    function over one profile's config file — reimplementing it here, or
+    loading another profile's full resolution state mid-tick, is out of scope
+    for a pre-spawn check (profiles are independent islands, root AGENTS.md).
+    """
+    model_override = (task.model_override or "").strip()
+    provider_override = (task.provider_override or "").strip()
+    assignee = (task.assignee or "").strip()
+    if not model_override or provider_override or not assignee:
+        return None
+    try:
+        from hermes_cli.profiles import _read_config_model, get_profile_dir
+        _model, provider = _read_config_model(get_profile_dir(assignee))
+    except Exception:
+        return None
+    if (provider or "").strip() != "openai-codex":
+        return None
+    try:
+        from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, _finalize_codex_models
+        allowlist = set(_finalize_codex_models(list(DEFAULT_CODEX_MODELS)))
+    except Exception:
+        return None
+    if model_override in allowlist:
+        return None
+    return (
+        f"model {model_override!r} is not in the openai-codex OAuth allowlist "
+        f"and no provider_override was set (profile {assignee!r} pins "
+        "model.provider: openai-codex)"
+    )
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1550,6 +1700,14 @@ def _dispatch_lane_task(
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
+        return False
+    codex_mismatch = _resolve_task_codex_mismatch(claimed)
+    if codex_mismatch is not None:
+        if _record_task_failure(
+            conn, claimed.id, codex_mismatch,
+            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
         return False
     try:
         resolved_branch_name = None
@@ -1631,6 +1789,7 @@ def _run_reclaim_phase(
     stale_timeout_seconds: int,
     failure_limit: int,
     reconcile_orphans: bool,
+    board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -1638,7 +1797,7 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
@@ -1770,7 +1929,7 @@ def _dispatch_once_locked(
     result = DispatchResult()
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
-        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
+        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
