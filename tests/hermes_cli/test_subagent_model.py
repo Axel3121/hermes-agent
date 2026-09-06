@@ -243,7 +243,7 @@ def _stub_auth_restore(monkeypatch):
 
     restored = []
     monkeypatch.setattr(
-        subagent_model, "_read_auth_active_provider", lambda: "parent-auth"
+        subagent_model, "_snapshot_auth_active_provider", lambda: "parent-auth"
     )
 
     def restore(model_before, active_provider_before):
@@ -381,51 +381,6 @@ def test_shared_full_picker_uses_named_custom_initial_provider(monkeypatch):
     assert "provider-default" not in selected_labels[0]
     assert "currently active" in selected_labels[0]
     assert selected_provider_models == ["sub-model"]
-
-
-def test_restore_primary_route_attempts_auth_after_model_restore_interrupt(monkeypatch):
-    from contextlib import nullcontext
-
-    auth_saves = []
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config",
-        lambda: (_ for _ in ()).throw(KeyboardInterrupt("config restore interrupted")),
-    )
-    monkeypatch.setattr("hermes_cli.auth._auth_store_lock", nullcontext)
-    monkeypatch.setattr(
-        "hermes_cli.auth._load_auth_store",
-        lambda: {"active_provider": "temporary-provider"},
-    )
-    monkeypatch.setattr(
-        "hermes_cli.auth._save_auth_store",
-        lambda store: auth_saves.append(dict(store)),
-    )
-
-    with pytest.raises(RuntimeError, match="config restore interrupted"):
-        subagent_model._restore_primary_route("old-model", "old-provider")
-
-    assert auth_saves == [{"active_provider": "old-provider"}]
-
-
-def test_restore_primary_route_preserves_absent_active_provider(monkeypatch):
-    from contextlib import nullcontext
-
-    store = {"version": 1, "providers": {}}
-
-    def save_auth(value):
-        store.clear()
-        store.update(value)
-
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
-    monkeypatch.setattr("hermes_cli.config.save_config", lambda _config: None)
-    monkeypatch.setattr("hermes_cli.auth._auth_store_lock", nullcontext)
-    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: dict(store))
-    monkeypatch.setattr("hermes_cli.auth._save_auth_store", save_auth)
-
-    before = subagent_model._read_auth_active_provider()
-    subagent_model._restore_primary_route(None, before)
-
-    assert "active_provider" not in store
 
 
 def test_full_picker_keeps_setup_side_effects_and_restores_primary(monkeypatch):
@@ -784,7 +739,7 @@ def test_cleanup_failure_does_not_mask_picker_failure(monkeypatch):
         {"model": {"default": "parent-model", "provider": "parent-provider"}},
     )
     monkeypatch.setattr(
-        subagent_model, "_read_auth_active_provider", lambda: "parent-auth"
+        subagent_model, "_snapshot_auth_active_provider", lambda: "parent-auth"
     )
     monkeypatch.setattr(
         subagent_model,

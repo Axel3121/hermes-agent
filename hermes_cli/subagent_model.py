@@ -14,8 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+# The same snapshot/restore pair `hermes fallback add` wraps around the shared picker.
+from hermes_cli.fallback_cmd import _restore_primary_route, _snapshot_auth_active_provider
 
-_MISSING_ACTIVE_PROVIDER = object()
 
 
 @dataclass(frozen=True)
@@ -278,49 +279,6 @@ def _canonical_picker_provider(model_config: Any, full_config: dict[str, Any]) -
     )
 
 
-def _read_auth_active_provider() -> Any:
-    """Read the primary auth provider before the picker mutates it."""
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store
-
-    with _auth_store_lock():
-        store = _load_auth_store()
-        return store.get("active_provider", _MISSING_ACTIVE_PROVIDER)
-
-
-def _restore_primary_route(model_before: Any, active_provider_before: Any) -> None:
-    """Restore both primary-route stores and report partial cleanup."""
-    import copy
-
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
-    from hermes_cli.config import load_config, save_config
-
-    restore_errors: list[BaseException] = []
-    try:
-        config = load_config()
-        if model_before is None:
-            config.pop("model", None)
-        else:
-            config["model"] = copy.deepcopy(model_before)
-        save_config(config)
-    except BaseException as exc:
-        restore_errors.append(exc)
-
-    try:
-        with _auth_store_lock():
-            store = _load_auth_store()
-            if active_provider_before is _MISSING_ACTIVE_PROVIDER:
-                store.pop("active_provider", None)
-            else:
-                store["active_provider"] = active_provider_before
-            _save_auth_store(store)
-    except BaseException as exc:
-        restore_errors.append(exc)
-
-    if restore_errors:
-        details = "; ".join(str(exc) for exc in restore_errors)
-        raise RuntimeError(f"Could not restore the primary model/auth route: {details}")
-
-
 def select_subagent_model_interactively(
     *, refresh: bool = False, initial_provider: Optional[str] = None
 ) -> Optional[SubagentModelStatus]:
@@ -354,7 +312,7 @@ def select_subagent_model_interactively(
         else None
     )
     model_before = copy.deepcopy(before_config.get("model"))
-    active_provider_before = _read_auth_active_provider()
+    active_provider_before = _snapshot_auth_active_provider()
     selected_config: Optional[dict[str, Any]] = None
     selections: list[str] = []
 
