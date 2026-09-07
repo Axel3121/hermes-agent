@@ -1483,6 +1483,52 @@ def test_nonzero_crash_extracts_real_reason_from_quiet_mode_log(kanban_home):
         conn.close()
 
 
+def test_nonzero_crash_ignores_stale_error_from_a_prior_attempt(kanban_home):
+    """A crash extraction must never fall through to an OLDER attempt's
+    ``Error:`` line when the CURRENT attempt crashed before printing anything.
+
+    CodeRabbit finding on PR #104643: worker logs are append-only across
+    re-runs (``_open_worker_log`` opens ``"ab"`` by design — an unblock/retry
+    must not destroy prior-attempt history for `hermes kanban log`). Before
+    the attempt-boundary fix, the scan-from-the-end loops had no way to tell
+    where the CURRENT attempt's output starts, so a fresh worker that died
+    with zero output (e.g. an immediate OOM-kill or `hermes` binary missing)
+    would report the PREVIOUS, already-resolved attempt's error as if it were
+    the current failure — misleading exactly the way this whole feature was
+    built to stop.
+    """
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="stale prior attempt", assignee="worker")
+        log_path = _kb.worker_log_path(tid, board=None)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Attempt 1: a real, now-resolved error (e.g. the old codex mismatch).
+        log_path.write_text(
+            _kbd._attempt_boundary_line(1).decode("utf-8")
+            + "Error: HTTP 400: The 'claude-sonnet-5' model is not supported "
+            "when using Codex with a ChatGPT account.\n"
+            "\nsession_id: 20260907_000000_attempt1\n",
+            encoding="utf-8",
+        )
+        # Attempt 2 (the CURRENT one): boundary written, then the process died
+        # before printing a single byte of its own — e.g. a signal on launch.
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(_kbd._attempt_boundary_line(2).decode("utf-8"))
+
+        events = _drive_nonzero_crash(conn, tid, 992005)
+        assert events == [tid]
+
+        run = kb.list_runs(conn, tid, include_active=False)[-1]
+        # Must NOT resurrect attempt 1's resolved error as the current reason.
+        assert "claude-sonnet-5" not in (run.error or "")
+        assert run.error == "pid 992005 exited with code 1"
+    finally:
+        conn.close()
+
+
 def test_nonzero_crash_falls_back_to_generic_message_without_a_marker(kanban_home):
     """A nonzero exit whose log has no recognizable marker (or no log file at
     all) keeps the existing generic message — the extraction path must degrade

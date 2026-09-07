@@ -787,6 +787,20 @@ def _extract_failure_reason_from_log_text(log_text: Optional[str]) -> Optional[s
     try:
         lines = log_text.splitlines()
 
+        # Restrict every pattern below to the CURRENT attempt's own output.
+        # The log is append-only across re-runs (see _attempt_boundary_line);
+        # without this cut, a new attempt that crashes before printing
+        # anything would let the scan-from-the-end loops fall through to a
+        # stale Error:/HTTP-error line from an OLDER, already-resolved
+        # attempt (CodeRabbit finding on PR #104643). A log with no boundary
+        # marker at all (written before this fix landed, or truncated by
+        # tail_bytes past every boundary) keeps the full text — same
+        # behavior as before this fix, never worse.
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].startswith(_ATTEMPT_BOUNDARY_PREFIX):
+                lines = lines[i + 1:]
+                break
+
         for i in range(len(lines) - 1, -1, -1):
             m = _NONRETRYABLE_RE.search(lines[i])
             if not m:
@@ -2335,17 +2349,46 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     return cmd
 
 
+_ATTEMPT_BOUNDARY_PREFIX = "=== KANBAN ATTEMPT run_id="
+
+
+def _attempt_boundary_line(run_id: Optional[int]) -> bytes:
+    """The marker `_open_worker_log` writes at the start of every spawn attempt.
+
+    CodeRabbit review of the first version of this failure-reason-extraction
+    feature (PR #104643) flagged that the log is append-only across re-runs
+    (``_open_worker_log`` opens ``"ab"``, by design — a re-run on unblock must
+    not destroy the prior attempt's history): if a NEW attempt crashes before
+    printing anything, the extractor's "scan from the end" logic could walk
+    past the current (empty) attempt and pick up a stale ``Error:`` line from
+    an OLDER attempt, misreporting a resolved failure as the current one. This
+    boundary line lets extraction cut the log to only the text written by the
+    most recent attempt before applying any pattern match.
+    """
+    return f"{_ATTEMPT_BOUNDARY_PREFIX}{run_id if run_id is not None else 'unknown'} ===\n".encode(
+        "utf-8"
+    )
+
+
 def _open_worker_log(task: Task, board: Optional[str]):
     """Append-mode per-task log (a re-run on unblock appends, never overwrites),
     rotated first. Anchored at the board root (not the shared kanban root) so
     `hermes kanban log` reads its own file and boards sharing task ids don't
-    collide."""
+    collide.
+
+    Writes an attempt-boundary marker line immediately after opening — see
+    ``_attempt_boundary_line`` for why: it lets failure-reason extraction
+    restrict itself to the CURRENT attempt's own output.
+    """
     log_dir = _kb.worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
-    return open(log_path, "ab")
+    log_f = open(log_path, "ab")
+    log_f.write(_attempt_boundary_line(task.current_run_id))
+    log_f.flush()
+    return log_f
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
