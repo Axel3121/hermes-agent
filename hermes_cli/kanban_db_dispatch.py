@@ -731,25 +731,56 @@ _PROTOCOL_VIOLATION_ERROR = (
 )
 
 
-# Markers printed by agent/turn_recovery.py's terminal-failure result builders. Reused
-# verbatim, not invented here — see nonretryable_client_error_result / log_api_error_attempt
-# / max_retries_exhausted_result.
+# Markers a kanban worker's log tail may contain, newest kind first. Every kanban worker now
+# runs with ``-Q`` (see ``_worker_argv`` — unconditional since PR #104351), which sets
+# ``suppress_status_output=True`` via ``_configure_quiet_agent``. That flag makes
+# ``_vprint(force=True)`` — and therefore every ``agent/turn_recovery.py`` ``_vlines(...)``
+# call, including the verbose "❌ Non-retryable client error (HTTP N). Aborting." /
+# "Provider: ... Model: ..." / "📝 Error: ..." block — a silent no-op (verified directly:
+# calling ``_vprint(..., force=True)`` on an agent with ``suppress_status_output=True``
+# prints nothing). ``cli.py``'s ``_print_exit_summary()`` (source of the "Resume this
+# session with:" footer) is likewise never called from the ``-Q`` path
+# (``_run_quiet_single_query``) — only from the non-quiet ``chat()`` path. So a REAL
+# quiet-mode worker's log for a failed turn contains none of that: only
+# ``cli.py._run_quiet_single_query``'s own two prints — either
+# ``Error: {result['error']}`` (stderr, when there's no ``final_response``) or the bare
+# ``final_response`` text (stdout, e.g. ``_failed_turn_result``'s non-retryable-error
+# summary) — followed by a blank line and ``session_id: <id>`` (stderr). Both stdout and
+# stderr land in the same worker log (spawn uses ``stderr=subprocess.STDOUT``).
+#
+# The verbose markers below are kept ONLY to still explain OLD logs captured before
+# PR #104351 made ``-Q`` unconditional (e.g. the historical ecosym-board logs this fix
+# was diagnosed against) — they are checked first as a strictly historical fallback, not
+# because they can appear in a future quiet-mode log.
 _LOG_FAILURE_REASON_MAX_LEN = 300
 _NONRETRYABLE_RE = re.compile(r"Non-retryable client error \(HTTP (\d+)\)\. Aborting\.")
 _PROVIDER_MODEL_RE = re.compile(r"Provider:\s*(\S+)\s+Model:\s*(\S+)")
 _ERROR_DETAIL_RE = re.compile(r"📝 Error:\s*(.+)")
 _RETRY_EXHAUSTED_RE = re.compile(r"API call failed after \d+ retries:?\s*(.*)")
 _RESUME_FOOTER_RE = re.compile(r"Resume this session with:")
+# The ACTUAL quiet-mode (-Q) failure shape: cli.py._run_quiet_single_query prints this to
+# stderr for a failed turn with no usable final_response.
+_QUIET_ERROR_LINE_RE = re.compile(r"^Error:\s*(.+)$")
+# Always the last stderr line _run_quiet_single_query prints, quiet or not — a stable
+# anchor for "the line(s) just before this are the real failure" in the -Q shape.
+_QUIET_SESSION_ID_RE = re.compile(r"^session_id:\s*\S+")
 
 
 def _extract_failure_reason_from_log_text(log_text: Optional[str]) -> Optional[str]:
     """Best-effort real failure reason from a worker's own log tail.
 
     Never raises; returns ``None`` when nothing recognizable is found so the caller keeps
-    the existing generic ``"pid N exited with code C"`` message. Preference order: (1) the
-    LAST non-retryable client error block (HTTP code + provider/model + detail line, all
-    printed by ``agent/turn_recovery.py``), (2) the last retry-exhaustion terminal line,
-    (3) the last non-empty line before the "Resume this session with:" footer.
+    the existing generic ``"pid N exited with code C"`` message. Preference order:
+    (1) the LAST non-retryable client error block (HTTP code + provider/model + detail
+    line) — historical logs only, see the module comment above these regexes;
+    (2) the last retry-exhaustion terminal line — same historical caveat;
+    (3) the REAL ``-Q`` shape: cli.py's own ``Error: <summary>`` stderr line, or (if that
+    line is absent) the last non-empty, non-``session_id:`` line before the trailing
+    ``session_id: <id>`` footer that ``_run_quiet_single_query`` always prints — this is
+    what a genuinely quiet-mode worker's log actually contains;
+    (4) the last non-empty line before the "Resume this session with:" footer — only
+    reachable on a non-``-Q`` worker log (kept for completeness/back-compat, not the
+    common case going forward).
     """
     if not log_text:
         return None
@@ -784,6 +815,28 @@ def _extract_failure_reason_from_log_text(log_text: Optional[str]) -> Optional[s
                 reason = f"API call failed after retries: {detail}" if detail else lines[i].strip()
                 return reason[:_LOG_FAILURE_REASON_MAX_LEN]
 
+        # Real -Q shape: find the LAST "Error: ..." line cli.py itself prints.
+        for i in range(len(lines) - 1, -1, -1):
+            m = _QUIET_ERROR_LINE_RE.match(lines[i].strip())
+            if m:
+                return m.group(1).strip()[:_LOG_FAILURE_REASON_MAX_LEN]
+
+        # No "Error:" line (a turn that had SOME final_response text but still exited
+        # nonzero for another reason, e.g. an iteration-budget partial): the line(s)
+        # right before the trailing "session_id: <id>" footer are the printed response.
+        session_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if _QUIET_SESSION_ID_RE.match(lines[i].strip()):
+                session_idx = i
+                break
+        if session_idx is not None:
+            for i in range(session_idx - 1, -1, -1):
+                line = lines[i].strip()
+                if line:
+                    return line[:_LOG_FAILURE_REASON_MAX_LEN]
+
+        # Historical (non-"-Q") shape fallback: last line before the interactive
+        # "Resume this session with:" footer, unreachable from a real -Q log.
         footer_idx = None
         for i in range(len(lines) - 1, -1, -1):
             if _RESUME_FOOTER_RE.search(lines[i]):

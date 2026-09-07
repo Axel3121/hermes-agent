@@ -1393,14 +1393,16 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
 # ---------------------------------------------------------------------------
 
 
-def test_nonzero_crash_extracts_real_reason_from_worker_log(kanban_home):
+def test_nonzero_crash_extracts_real_reason_from_historical_verbose_log(kanban_home):
     """A nonzero exit whose log has a non-retryable-client-error block gets that
     reason recorded on the crash — not the bare generic message.
 
-    Regression for the dispatcher mislabeling early client-error crashes: once
-    ``-Q`` is unconditional, this failure mode exits 1 (not 0), so it must land
-    on ``_classify_dead_worker``'s ``nonzero_exit`` branch with a real reason
-    pulled from the worker's own log tail.
+    This is the OLD (pre-PR-#104351) verbose log shape, kept only because real
+    historical logs on this exact repo's ecosym board were captured in it before
+    ``-Q`` became unconditional. See
+    ``test_nonzero_crash_extracts_real_reason_from_quiet_mode_log`` for the shape a
+    genuinely quiet-mode (``-Q``) worker log actually has going forward — that one
+    is the regression test for the common case.
     """
     import hermes_cli.kanban_db as _kb
 
@@ -1432,6 +1434,51 @@ def test_nonzero_crash_extracts_real_reason_from_worker_log(kanban_home):
 
         task = kb.get_task(conn, tid)
         assert "claude-sonnet-5 not supported when using Codex" in (task.last_failure_error or "")
+    finally:
+        conn.close()
+
+
+def test_nonzero_crash_extracts_real_reason_from_quiet_mode_log(kanban_home):
+    """A nonzero exit whose log has the REAL ``-Q`` (quiet-mode) shape gets the
+    printed ``Error: ...`` reason recorded — not the bare generic message.
+
+    Every kanban worker runs with ``-Q`` unconditionally (PR #104351), which sets
+    ``suppress_status_output=True``. That makes ``_vprint(force=True)`` — and every
+    ``agent/turn_recovery.py`` diagnostic line built on it (the verbose
+    "Non-retryable client error" block the other test's log fixture uses) — a
+    silent no-op. A REAL quiet-mode worker log for this failure instead contains
+    only ``cli.py._run_quiet_single_query``'s own ``Error: <summary>`` stderr line
+    followed by ``session_id: <id>``. This is the actual log shape every FUTURE
+    early crash produces; the other (historical-verbose) test's fixture shape is
+    unreachable once ``-Q`` is unconditional.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="quiet-mode model mismatch", assignee="worker")
+        log_path = _kb.worker_log_path(tid, board=None)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "Query: work kanban task t_quiet\n"
+            "Error: HTTP 400: The 'claude-sonnet-5' model is not supported when "
+            "using Codex with a ChatGPT account.\n"
+            "\n"
+            "session_id: 20260907_000000_abc123\n",
+            encoding="utf-8",
+        )
+
+        events = _drive_nonzero_crash(conn, tid, 992004)
+        assert events == [tid]
+
+        run = kb.list_runs(conn, tid, include_active=False)[-1]
+        assert "400" in run.error
+        assert "claude-sonnet-5" in run.error
+        assert "not supported when using Codex" in run.error
+        assert run.error != "pid 992004 exited with code 1"
+
+        task = kb.get_task(conn, tid)
+        assert "not supported when using Codex" in (task.last_failure_error or "")
     finally:
         conn.close()
 
