@@ -541,6 +541,30 @@ The dispatcher emits one `--skills <name>` flag per skill listed, so the worker 
 
 **Review/verifier tasks auto-isolate.** If a task's `--skill` list includes `kanban-independent-verification` or `requesting-code-review`, the dispatcher additionally spawns that worker with `--ignore-rules`. Those two skills mark a task as judging someone else's work, and a verifier dispatched on the same profile as the worker it's checking would otherwise inherit that profile's `MEMORY.md`/`USER.md` and profile-preloaded skills — which can already contain the worker's own self-report or framing from earlier in the same profile's history, undermining the independence a verifier exists to provide. `--ignore-rules` only skips that ambient injection; the task's own forced `--skills` (including the review skill itself) still load normally, and kanban lifecycle tools stay available. This is isolation, not evidence verification — it does not by itself force the verifier to check anything real; see the `kanban-independent-verification` skill for that discipline.
 
+### Narrowing a worker's toolsets
+
+Use repeatable `--toolsets` when a card needs fewer capabilities than its
+assignee profile normally has. This is a narrowing-only scope, not a way to
+grant tools: Hermes intersects the requested names with the assignee profile's
+configured CLI toolsets at worker spawn. A requested toolset absent from that
+profile is silently excluded, so a task can never escalate access.
+
+```bash
+# This verifier can use only the profile's existing file and web toolsets.
+hermes kanban create "Verify release evidence" --assignee reviewer \
+    --toolsets file --toolsets web
+
+# Swarm worker format: PROFILE:TITLE[:SKILL,SKILL[:TOOLSET,TOOLSET]]
+hermes kanban swarm "Research and verify" \
+    --worker "researcher:Find primary sources::web,file" \
+    --verifier reviewer --synthesizer writer
+```
+
+Use `hermes kanban set-toolsets <task-id> <toolset> ...` to change a queued
+card's scope for its next dispatch. Omitting toolset names sets an explicitly
+empty worker toolset, not the profile default; task lifecycle tools remain
+available independently so the worker can still report completion or a block.
+
 ### Per-task model override
 
 Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:
