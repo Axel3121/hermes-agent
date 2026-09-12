@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from toolsets import get_toolset_names
+from toolsets import get_toolset_names, validate_toolset
 
 _log = logging.getLogger(__name__)
 
@@ -701,6 +701,7 @@ class Task:
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     skills: Optional[list] = None            # None = defaults only; [] = explicitly none
+    toolsets_override: Optional[list] = None # None = profile toolsets; [] = explicitly none
     model_override: Optional[str] = None
     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
@@ -721,6 +722,8 @@ class Task:
         g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        parsed_toolsets = _json_or(g("toolsets_override"))
+        toolsets_value = [str(s) for s in parsed_toolsets if s] if isinstance(parsed_toolsets, list) else None
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -730,6 +733,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            toolsets_override=toolsets_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -893,6 +897,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    -- Narrowing-only toolset scope for this worker, stored as JSON. At spawn it
+    -- is intersected with the assignee profile's configured CLI toolsets; it
+    -- can never add a capability the profile does not already have.
+    toolsets_override    TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -1218,6 +1226,38 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _normalize_task_toolsets(toolsets: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Strip/dedupe known toolsets for a narrowing-only task override.
+
+    This validates names, not permissions: dispatch intersects the stored list
+    with the assignee profile's configured toolsets, so a task can never widen
+    profile access.
+    """
+    if toolsets is None:
+        return None
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in toolsets:
+        if not value:
+            continue
+        name = str(value).strip()
+        if not name:
+            continue
+        if "," in name:
+            raise ValueError(
+                f"toolset name cannot contain comma: {name!r} "
+                "(pass separate toolset names instead of a comma-joined string)"
+            )
+        if not validate_toolset(name):
+            raise ValueError(f"unknown toolset: {name!r}")
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(name)
+    return cleaned
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1225,6 +1265,7 @@ def create_task(
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
+    toolsets_override: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
@@ -1285,6 +1326,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    toolsets_list = _normalize_task_toolsets(toolsets_override)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1329,10 +1371,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, toolsets_override, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1340,6 +1382,7 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(toolsets_list) if toolsets_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
@@ -1361,6 +1404,7 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        "toolsets_override": list(toolsets_list) if toolsets_list is not None else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -1537,6 +1581,23 @@ def set_model_override(
         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
         "model_override_set", {"model": model, "provider": provider},
         ("model_override", "provider_override"), archived_msg="cannot set model override",
+    )
+
+
+def set_toolsets_override(
+    conn: sqlite3.Connection, task_id: str, toolsets: Optional[Iterable[str]],
+) -> bool:
+    """Set the next worker's narrowing-only toolset override.
+
+    The stored list is never an authority grant: worker spawn intersects it
+    with the assignee profile's configured toolsets.
+    """
+    normalized = _normalize_task_toolsets(toolsets)
+    return _set_task_override(
+        conn, task_id, "UPDATE tasks SET toolsets_override = ? WHERE id = ?",
+        (json.dumps(normalized) if normalized is not None else None,),
+        "toolsets_override_set", {"toolsets_override": normalized},
+        ("toolsets_override",), archived_msg="cannot set toolsets override",
     )
 
 
