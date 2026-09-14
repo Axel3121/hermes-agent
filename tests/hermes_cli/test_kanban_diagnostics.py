@@ -299,3 +299,7 @@ def test_optimization_rule_number_does_not_cross_satisfy_both_fields():
     assert len(hits) == 1
     assert hits[0].data["has_baseline"] is False
     assert hits[0].data["has_threshold"] is True
+    # coderabbit finding: title must name the field that's ACTUALLY missing
+    # (threshold is present here, only baseline is missing).
+    assert "savings threshold" not in hits[0].title.lower()
+    assert "cost baseline" in hits[0].title.lower()

@@ -720,28 +720,28 @@ _OPTIMIZATION_COST_GATE_DEAD_STATUSES = frozenset({"done", "archived"})
 def _has_numeric_field_near(
     text: str, keyword_pattern: str, *, window: int = 80, other_pattern: Optional[str] = None,
 ) -> bool:
-    """True if a digit appears within ``window`` chars of a keyword-pattern
-    match in ``text`` AND that digit is at least as close to this match as
-    to any match of ``other_pattern`` — a guess doesn't satisfy the field,
-    only an actual quantified value tied to THIS field does. Without the
-    other-pattern check, two keyword phrases sitting close together (e.g.
-    "measured cost ... $10 ... savings threshold") could let one field's
-    number satisfy the other field's requirement too (flagged by coderabbit
-    review on this exact rule)."""
+    """True if a complete number appears within ``window`` chars of a
+    keyword-pattern match in ``text`` AND that number is strictly closer to
+    this match than to any match of ``other_pattern`` — a guess doesn't
+    satisfy the field, only an actual quantified value tied to THIS field
+    does. Ties (equidistant from both fields) count for neither, since the
+    number can't be confidently attributed. Matches whole numeric tokens
+    (``\\d+`` with optional decimal), not lone digits, so "10" is one
+    candidate, not two (flagged by coderabbit review on this exact rule)."""
     if not text:
         return False
     other_matches = list(re.finditer(other_pattern, text, re.IGNORECASE)) if other_pattern else []
     for m in re.finditer(keyword_pattern, text, re.IGNORECASE):
         start = max(0, m.start() - window)
         end = min(len(text), m.end() + window)
-        for dm in re.finditer(r"\d", text[start:end]):
-            abs_pos = start + dm.start()
-            dist_this = min(abs(abs_pos - m.start()), abs(abs_pos - m.end()))
+        for nm in re.finditer(r"\d+(?:\.\d+)?", text[start:end]):
+            abs_start, abs_end = start + nm.start(), start + nm.end()
+            dist_this = min(abs(abs_start - m.start()), abs(abs_end - m.end()))
             dist_other = min(
-                (min(abs(abs_pos - om.start()), abs(abs_pos - om.end())) for om in other_matches),
+                (min(abs(abs_start - om.start()), abs(abs_end - om.end())) for om in other_matches),
                 default=float("inf"),
             )
-            if dist_this <= dist_other:
+            if dist_this < dist_other:
                 return True
     return False
 
@@ -806,10 +806,16 @@ def _rule_optimization_missing_cost_baseline(task, events, runs, now, cfg) -> li
             suggested=True,
         ),
     ]
+    if not has_baseline and not has_threshold:
+        title = "Optimization card has no cost baseline or savings threshold"
+    elif not has_baseline:
+        title = "Optimization card has no cost baseline — status quo spend never quantified"
+    else:
+        title = "Optimization card has no savings threshold — no bar for \"worth it\""
     created_at = int(_task_field(task, "created_at", default=0) or 0) or int(now)
     return [Diagnostic(
         kind="optimization_missing_cost_baseline", severity="warning",
-        title="Optimization card has no cost baseline — status quo spend never quantified",
+        title=title,
         detail=(
             "This card reads as optimization/cost-reduction/routing/caching work but its body "
             "is missing " + " and ".join(missing) + ". Without a quantified baseline, "
