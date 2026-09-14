@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import json
+import re
 import time
 
 
@@ -678,6 +679,135 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+# Title/body shapes that mean "this card's job is to make something cheaper
+# or faster" — optimization, cost-reduction, or latency work. Deliberately
+# broad (title AND body, not title-only like the review-intent rule): a
+# card's optimization intent is usually stated in the body's problem
+# framing, not just the title.
+#
+# No pre-existing board/skill convention for tagging optimization cards was
+# found before this rule was written (checked: no "optimization" skill
+# directory under any profile's skills/, no board column or tag convention
+# referencing it on any of the four live board DBs) — so the skill tag
+# "optimization" is a new, additive convention, checked here alongside the
+# regex fallback rather than relied on exclusively.
+OPTIMIZATION_INTENT_PATTERN = (
+    r"\b(?:optimi[sz]e[sd]?|optimi[sz]ation|routing|cach(?:e|ing)|"
+    r"speed[- ]?up|reduce\s+(?:cost|latency|spend)|cut\s+cost|"
+    r"cost[- ]?reduc\w*)\b"
+)
+
+# A "measured baseline cost" field: a keyword phrase for what the status quo
+# costs TODAY, with a number within reach (time, money, error rate) — a
+# guess ("probably slow") doesn't count, a quantified value does. English
+# and Norwegian variants both accepted since cards on this board are
+# sometimes written in Norwegian (see t_2f9851d5's own card body).
+_COST_BASELINE_KEYWORDS = (
+    r"(?:measured|current|baseline|status.?quo|today'?s?)\s+cost|"
+    r"m[aå]lt\s+kostnad"
+)
+# A "savings threshold" field: an explicit "must save at least N to be worth
+# it" bar, meant to be set BEFORE any instrument gets built.
+_SAVINGS_THRESHOLD_KEYWORDS = (
+    r"must\s+save|worth\s+it|savings?\s+threshold|break.?even|"
+    r"krever\s+spart|verdt\s+seg"
+)
+
+# Terminal statuses: the work already ran (or never will), flagging is moot.
+_OPTIMIZATION_COST_GATE_DEAD_STATUSES = frozenset({"done", "archived"})
+
+
+def _has_numeric_field_near(text: str, keyword_pattern: str, *, window: int = 80) -> bool:
+    """True if a digit appears within ``window`` chars of a keyword-pattern
+    match in ``text`` — a guess doesn't satisfy the field, only an actual
+    quantified value does."""
+    if not text:
+        return False
+    for m in re.finditer(keyword_pattern, text, re.IGNORECASE):
+        start = max(0, m.start() - window)
+        end = min(len(text), m.end() + window)
+        if re.search(r"\d", text[start:end]):
+            return True
+    return False
+
+
+def _rule_optimization_missing_cost_baseline(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A card that reads as optimization/cost-reduction/speed-up/routing/
+    caching work (by skill tag "optimization" or by title+body regex) but
+    whose body never quantifies (a) what the status quo costs today and
+    (b) how much the change must save to be worth doing. Modeled directly on
+    _rule_review_intent_untagged (t_38792276): same shape, same severity,
+    same config-disable escape hatch.
+
+    Rationale (see t_2f9851d5): the model-routing card t_678289cc ran three
+    full instrumentation rounds — corpus, five blind labelers, kappa scoring,
+    multiple adversarial reviews — before anyone asked whether the work was
+    worth starting, because the card model had no field to ask for that in.
+    Heuristic by construction, hence ``warning``, not a hard block; set
+    ``cfg["optimization_intent_pattern"] = ""`` to disable entirely.
+    """
+    pattern = cfg.get("optimization_intent_pattern", OPTIMIZATION_INTENT_PATTERN)
+    if not pattern:
+        return []
+    status = _task_field(task, "status")
+    if status in _OPTIMIZATION_COST_GATE_DEAD_STATUSES:
+        return []
+
+    skills = _task_field(task, "skills") or ()
+    if isinstance(skills, str):
+        try:
+            skills = json.loads(skills) or ()
+        except Exception:
+            skills = ()
+    tagged_optimization = "optimization" in skills
+
+    title = _task_field(task, "title") or ""
+    body = _task_field(task, "body") or ""
+    title_body_match = re.search(pattern, f"{title}\n{body}", re.IGNORECASE)
+    if not (tagged_optimization or title_body_match):
+        return []
+
+    has_baseline = _has_numeric_field_near(body, _COST_BASELINE_KEYWORDS)
+    has_threshold = _has_numeric_field_near(body, _SAVINGS_THRESHOLD_KEYWORDS)
+    if has_baseline and has_threshold:
+        return []
+
+    missing = []
+    if not has_baseline:
+        missing.append("a measured baseline cost (a number for what the status quo costs today, not a guess)")
+    if not has_threshold:
+        missing.append("a savings threshold (how much this must save to be worth it, set before building anything)")
+
+    task_id = str(_task_field(task, "id") or "")
+    actions = [
+        DiagnosticAction(
+            kind="comment",
+            label="Add the missing cost-gate field(s) to the card body",
+            payload={"task_id": task_id},
+            suggested=True,
+        ),
+    ]
+    created_at = int(_task_field(task, "created_at", default=0) or 0) or int(now)
+    return [Diagnostic(
+        kind="optimization_missing_cost_baseline", severity="warning",
+        title="Optimization card has no cost baseline — status quo spend never quantified",
+        detail=(
+            "This card reads as optimization/cost-reduction/routing/caching work but its body "
+            "is missing " + " and ".join(missing) + ". Without a quantified baseline, "
+            "instrumentation work can run for multiple rounds before anyone asks whether it was "
+            "worth starting in the first place. Add the field(s) to the body, or dismiss this if "
+            "the card is not actually optimization work."
+        ),
+        actions=actions,
+        first_seen_at=created_at, last_seen_at=created_at, count=1,
+        data={
+            "tagged_optimization": tagged_optimization,
+            "matched_text": title_body_match.group(0).strip() if title_body_match else None,
+            "has_baseline": has_baseline, "has_threshold": has_threshold, "status": status,
+        },
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -689,6 +819,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_optimization_missing_cost_baseline,
 ]
 
 
@@ -703,6 +834,9 @@ DEFAULT_CONFIG = {
     # Below 30 min the signal is dominated by tasks about to be claimed on
     # the next dispatcher tick.
     "stranded_threshold_seconds": 30 * 60,
+    # Empty string disables the optimization-cost-baseline heuristic
+    # (``kanban.diagnostics.optimization_intent_pattern: ""``).
+    "optimization_intent_pattern": OPTIMIZATION_INTENT_PATTERN,
 }
 
 
