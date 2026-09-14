@@ -278,3 +278,24 @@ def test_optimization_rule_ignores_non_optimization_cards():
     diags = kd.compute_task_diagnostics(task, [], [])
     hits = [d for d in diags if d.kind == "optimization_missing_cost_baseline"]
     assert hits == []
+
+
+def test_optimization_rule_number_does_not_cross_satisfy_both_fields():
+    """coderabbit finding: a single number sitting between the two keyword
+    phrases must not satisfy BOTH fields at once — only the field it's
+    actually closer to."""
+    task = _task(
+        id="t_opt0003",
+        title="Route OpenCode's non-flagship agent roles to cheaper models",
+        # A lone "$10/day" between the two keyword phrases, but only
+        # actually describing the savings threshold, not the baseline.
+        body=(
+            "Static config change, no dynamic routing exists yet. "
+            "Measured cost today: unclear. Savings threshold: must save $10/day to be worth it."
+        ),
+    )
+    diags = kd.compute_task_diagnostics(task, [], [])
+    hits = [d for d in diags if d.kind == "optimization_missing_cost_baseline"]
+    assert len(hits) == 1
+    assert hits[0].data["has_baseline"] is False
+    assert hits[0].data["has_threshold"] is True
