@@ -225,3 +225,56 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# optimization_missing_cost_baseline rule
+#
+# A card that reads as optimization/cost-reduction/routing/caching work but
+# never quantifies (a) what the status quo costs today or (b) how much it
+# must save to be worth doing. See t_2f9851d5: three full instrumentation
+# rounds ran on the model-routing card before anyone asked if it was worth
+# starting, because the card model had no field to ask for that in.
+# ---------------------------------------------------------------------------
+
+
+def test_optimization_card_missing_cost_baseline_fires():
+    task = _task(
+        id="t_opt0001",
+        title="Route OpenCode's non-flagship agent roles to cheaper models",
+        body="Static config change, no dynamic routing exists yet.",
+        status="todo",
+    )
+    diags = kd.compute_task_diagnostics(task, [], [])
+    hits = [d for d in diags if d.kind == "optimization_missing_cost_baseline"]
+    assert len(hits) == 1
+    assert hits[0].severity == "warning"
+    assert hits[0].data["has_baseline"] is False
+    assert hits[0].data["has_threshold"] is False
+
+
+def test_optimization_card_with_quantified_baseline_and_threshold_clears():
+    task = _task(
+        id="t_opt0002",
+        title="Route OpenCode's non-flagship agent roles to cheaper models",
+        body=(
+            "Measured baseline cost: $42/day across non-flagship roles today. "
+            "Savings threshold: must save at least $10/day to be worth building."
+        ),
+        status="todo",
+    )
+    diags = kd.compute_task_diagnostics(task, [], [])
+    hits = [d for d in diags if d.kind == "optimization_missing_cost_baseline"]
+    assert hits == []
+
+
+def test_optimization_rule_ignores_non_optimization_cards():
+    task = _task(
+        id="t_plain001",
+        title="Fix typo in onboarding doc",
+        body="The word 'recieve' is misspelled on line 12.",
+        status="todo",
+    )
+    diags = kd.compute_task_diagnostics(task, [], [])
+    hits = [d for d in diags if d.kind == "optimization_missing_cost_baseline"]
+    assert hits == []
