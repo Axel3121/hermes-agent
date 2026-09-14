@@ -717,17 +717,32 @@ _SAVINGS_THRESHOLD_KEYWORDS = (
 _OPTIMIZATION_COST_GATE_DEAD_STATUSES = frozenset({"done", "archived"})
 
 
-def _has_numeric_field_near(text: str, keyword_pattern: str, *, window: int = 80) -> bool:
+def _has_numeric_field_near(
+    text: str, keyword_pattern: str, *, window: int = 80, other_pattern: Optional[str] = None,
+) -> bool:
     """True if a digit appears within ``window`` chars of a keyword-pattern
-    match in ``text`` — a guess doesn't satisfy the field, only an actual
-    quantified value does."""
+    match in ``text`` AND that digit is at least as close to this match as
+    to any match of ``other_pattern`` — a guess doesn't satisfy the field,
+    only an actual quantified value tied to THIS field does. Without the
+    other-pattern check, two keyword phrases sitting close together (e.g.
+    "measured cost ... $10 ... savings threshold") could let one field's
+    number satisfy the other field's requirement too (flagged by coderabbit
+    review on this exact rule)."""
     if not text:
         return False
+    other_matches = list(re.finditer(other_pattern, text, re.IGNORECASE)) if other_pattern else []
     for m in re.finditer(keyword_pattern, text, re.IGNORECASE):
         start = max(0, m.start() - window)
         end = min(len(text), m.end() + window)
-        if re.search(r"\d", text[start:end]):
-            return True
+        for dm in re.finditer(r"\d", text[start:end]):
+            abs_pos = start + dm.start()
+            dist_this = min(abs(abs_pos - m.start()), abs(abs_pos - m.end()))
+            dist_other = min(
+                (min(abs(abs_pos - om.start()), abs(abs_pos - om.end())) for om in other_matches),
+                default=float("inf"),
+            )
+            if dist_this <= dist_other:
+                return True
     return False
 
 
@@ -767,8 +782,12 @@ def _rule_optimization_missing_cost_baseline(task, events, runs, now, cfg) -> li
     if not (tagged_optimization or title_body_match):
         return []
 
-    has_baseline = _has_numeric_field_near(body, _COST_BASELINE_KEYWORDS)
-    has_threshold = _has_numeric_field_near(body, _SAVINGS_THRESHOLD_KEYWORDS)
+    has_baseline = _has_numeric_field_near(
+        body, _COST_BASELINE_KEYWORDS, other_pattern=_SAVINGS_THRESHOLD_KEYWORDS,
+    )
+    has_threshold = _has_numeric_field_near(
+        body, _SAVINGS_THRESHOLD_KEYWORDS, other_pattern=_COST_BASELINE_KEYWORDS,
+    )
     if has_baseline and has_threshold:
         return []
 
