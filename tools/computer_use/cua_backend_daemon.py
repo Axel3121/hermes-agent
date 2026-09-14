@@ -139,6 +139,14 @@ class _EmbeddedCuaDaemon:
         from tools.environments.local import _sanitize_subprocess_env
         return _sanitize_subprocess_env(self.child_env())
 
+    def _drain_stdout(self, process: Any) -> None:
+        """Fallback stdout drainer for when process_registry adoption is skipped or fails.
+        stdout is a real pipe (see start()), so someone MUST keep reading it or a chatty
+        daemon blocks once the pipe buffer fills."""
+        with contextlib.suppress(Exception):
+            for _ in getattr(process, "stdout", None) or ():
+                pass
+
     def _drain_stderr(self, process: Any) -> None:
         with contextlib.suppress(Exception):
             for line in getattr(process, "stderr", None) or ():
@@ -185,16 +193,31 @@ class _EmbeddedCuaDaemon:
         # inherits this worker's own systemd-scope MemoryMax cgroup cap (subprocess children share their
         # parent's cgroup — confirmed empirically, see #104953) rather than getting a second cap of its
         # own. notify_on_complete=False: nothing should chat-notify when an internal daemon exits.
+        # Skipped on macOS: there ``self._process`` is ``/usr/bin/open`` (see
+        # _embedded_daemon_spawn_command), a short-lived launch helper that exits once it hands the
+        # request to LaunchServices, NOT the actual cua-driver daemon — adopting it would checkpoint
+        # and later "recover" the wrong, already-exited PID while the real daemon keeps running
+        # untracked (coderabbit finding, #104953). Registering the true daemon PID on macOS needs its
+        # own resolution path (e.g. from CuaDriver.app's process list); out of scope here.
         # isinstance-gated: test suites patch subprocess.Popen with a Mock() (no real stdout pipe/fd,
         # and even replace the ``subprocess.Popen`` class itself), so isinstance() and the adoption both
         # go inside the broad suppress — a mocked process must never spin a real reader thread against
         # fake stream attributes, but a mocking failure here must never break daemon startup either.
-        with contextlib.suppress(Exception):
-            if isinstance(self._process, subprocess.Popen):
-                from tools.process_registry import process_registry
-                session = process_registry.adopt_local(
-                    self._process, command=" ".join(command), cwd=None, notify_on_complete=False)
-                self._registry_session_id = session.id
+        registered = False
+        if sys.platform != "darwin":
+            with contextlib.suppress(Exception):
+                if isinstance(self._process, subprocess.Popen):
+                    from tools.process_registry import process_registry
+                    session = process_registry.adopt_local(
+                        self._process, command=" ".join(command), cwd=None, notify_on_complete=False)
+                    self._registry_session_id = session.id
+                    registered = True
+        if not registered:
+            # Registry adoption owns draining stdout via its reader thread; without it (macOS, or a
+            # failed/suppressed adoption above) something must still drain the real pipe or a chatty
+            # daemon blocks once the OS pipe buffer fills.
+            threading.Thread(target=self._drain_stdout, args=(self._process,),
+                             name="hermes-cua-daemon-stdout", daemon=True).start()
         deadline = time.monotonic() + self._START_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             return_code = self._process.poll()
