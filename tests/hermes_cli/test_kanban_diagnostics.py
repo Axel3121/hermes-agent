@@ -282,6 +282,23 @@ def test_review_intent_untagged_silent_for_cards_in_the_review_lane():
     assert _review_diag(_review_card(status="review")) == []
 
 
+def test_review_intent_untagged_shell_quotes_the_card_title():
+    """The suggested command is copy-pasted into a shell and the title is
+    card-supplied text, so it must be shell-quoted. An unquoted title carrying
+    a quote or a ``;`` would produce a broken — or actively dangerous —
+    command in the operator's terminal."""
+    import shlex
+
+    nasty = 'Review "x"; rm -rf ~/tmp #'
+    diags = _review_diag(_review_card(title=nasty))
+    assert len(diags) == 1
+    command = [a for a in diags[0].actions if a.suggested][0].payload["command"]
+    # The whole title must survive as exactly ONE shell word.
+    parsed = shlex.split(command)
+    assert nasty in parsed
+    assert parsed[:3] == ["hermes", "kanban", "create"]
+
+
 def test_review_intent_untagged_can_be_disabled_by_config():
     assert _review_diag(_review_card(), config={"review_intent_pattern": ""}) == []
 

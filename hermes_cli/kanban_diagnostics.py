@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import json
 import re
+import shlex
 import time
 
 
@@ -757,7 +758,10 @@ def _rule_review_intent_untagged(task, events, runs, now, cfg) -> list[Diagnosti
     task_id = str(_task_field(task, "id") or "")
     # A task's skills are create-only (no edit/PATCH path writes them), so the
     # recovery really is "create the card again, tagged" — not "edit this one".
-    recreate = f'hermes kanban create --review "{title}" --assignee {assignee}'
+    recreate = (
+        "hermes kanban create --review "
+        f"{shlex.quote(title)} --assignee {shlex.quote(assignee)}"
+    )
     actions = [
         _cli_hint("Re-create this card review-tagged (skills are set at creation)",
                   recreate, suggested=True),
