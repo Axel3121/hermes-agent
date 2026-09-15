@@ -830,6 +830,51 @@ def test_task_toolsets_override_round_trips_to_json_output(kanban_home):
         conn.close()
 
 
+def test_task_toolsets_override_accepts_configured_mcp_server_name(kanban_home, monkeypatch):
+    """A name configured under ``mcp_servers`` is a valid toolset override.
+
+    Regression guard: ``_normalize_task_toolsets`` used to reject any name
+    absent from the static/plugin toolset registry, even when it was a
+    legitimately configured MCP server name (these only resolve as toolsets
+    after ``discover_mcp_tools`` runs, which this validation-time path never
+    does). CodeRabbit flagged this independently twice reviewing an
+    unrelated respawn-guard fix.
+    """
+    from hermes_cli.config import get_config_path
+
+    get_config_path().write_text(
+        "mcp_servers:\n  my_custom_server:\n    command: my-server\n",
+        encoding="utf-8",
+    )
+
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="mcp-scoped worker", assignee="worker",
+            toolsets_override=["terminal", "my_custom_server"],
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.toolsets_override == ["terminal", "my_custom_server"]
+    finally:
+        conn.close()
+
+
+def test_task_toolsets_override_still_rejects_unknown_name(kanban_home):
+    """Names that are neither a static toolset nor a configured MCP server
+    are still rejected — the MCP-server allowance must not turn into an
+    accept-anything path."""
+    conn = kbc.connect()
+    try:
+        with pytest.raises(ValueError, match="unknown toolset"):
+            kb.create_task(
+                conn, title="bad toolset worker", assignee="worker",
+                toolsets_override=["totally-not-a-real-toolset"],
+            )
+    finally:
+        conn.close()
+
+
 def test_kanban_create_parser_collects_repeatable_toolsets():
     from hermes_cli.kanban_parser import build_parser
 
