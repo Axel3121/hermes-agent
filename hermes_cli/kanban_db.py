@@ -1228,31 +1228,54 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
-def _configured_mcp_server_names() -> set[str]:
-    """Names configured under ``mcp_servers`` in the active config.yaml.
+def _configured_mcp_server_names(assignee: Optional[str] = None) -> set[str]:
+    """Names configured under ``mcp_servers`` for *assignee*'s own profile.
 
     A static-toolset check alone rejects a valid MCP-server-named override
     (e.g. ``--toolsets my-custom-server``): MCP server names only resolve as
     toolsets after ``discover_mcp_tools`` runs, which this validation-time
     path never does. Mirrors the same allowance ``cli.py``'s own unknown-
-    toolset warning already makes. Best-effort: an unreadable/missing config
-    must not block task creation, so this degrades to an empty set.
+    toolset warning already makes.
+
+    Reads the ASSIGNEE profile's config, not the caller's: a task overrides
+    scope a *different* profile's worker, and profiles are isolated islands
+    (each has its own ``mcp_servers``) — validating against the wrong one
+    would accept names foreign to the profile that actually dispatches, or
+    reject ones that belong to it. Falls back to the caller's own config when
+    no assignee is known yet (e.g. ``set_toolsets_override`` callers that
+    could not resolve one). Best-effort throughout: an unreadable/missing
+    config or profile must not block task creation, so this degrades to an
+    empty set.
     """
     try:
         from hermes_cli.config import load_config
-        return set((load_config().get("mcp_servers") or {}).keys())
+        if not assignee:
+            return set((load_config().get("mcp_servers") or {}).keys())
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.profiles import get_profile_dir
+        try:
+            profile_dir = get_profile_dir(assignee)
+        except Exception:
+            return set((load_config().get("mcp_servers") or {}).keys())
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            return set((load_config().get("mcp_servers") or {}).keys())
+        finally:
+            reset_hermes_home_override(token)
     except Exception:
         _log.debug("could not resolve configured mcp_servers for toolset validation", exc_info=True)
         return set()
 
 
-def _normalize_task_toolsets(toolsets: Optional[Iterable[str]]) -> Optional[list[str]]:
+def _normalize_task_toolsets(
+    toolsets: Optional[Iterable[str]], *, assignee: Optional[str] = None,
+) -> Optional[list[str]]:
     """Strip/dedupe known toolsets for a narrowing-only task override.
 
     This validates names, not permissions: dispatch intersects the stored list
     with the assignee profile's configured toolsets, so a task can never widen
     profile access. A name is accepted when it is either a known static/plugin
-    toolset OR a server named under the active config's ``mcp_servers`` —
+    toolset OR a server named under *assignee*'s own ``mcp_servers`` config —
     anything else is still rejected.
     """
     if toolsets is None:
@@ -1273,7 +1296,7 @@ def _normalize_task_toolsets(toolsets: Optional[Iterable[str]]) -> Optional[list
             )
         if not validate_toolset(name):
             if mcp_names is None:
-                mcp_names = _configured_mcp_server_names()
+                mcp_names = _configured_mcp_server_names(assignee)
             if name not in mcp_names:
                 raise ValueError(f"unknown toolset: {name!r}")
         key = name.casefold()
@@ -1352,7 +1375,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
-    toolsets_list = _normalize_task_toolsets(toolsets_override)
+    toolsets_list = _normalize_task_toolsets(toolsets_override, assignee=assignee)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1636,7 +1659,9 @@ def set_toolsets_override(
     The stored list is never an authority grant: worker spawn intersects it
     with the assignee profile's configured toolsets.
     """
-    normalized = _normalize_task_toolsets(toolsets)
+    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assignee = row["assignee"] if row else None
+    normalized = _normalize_task_toolsets(toolsets, assignee=assignee)
     return _set_task_override(
         conn, task_id, "UPDATE tasks SET toolsets_override = ? WHERE id = ?",
         (json.dumps(normalized) if normalized is not None else None,),

@@ -839,10 +839,14 @@ def test_task_toolsets_override_accepts_configured_mcp_server_name(kanban_home, 
     after ``discover_mcp_tools`` runs, which this validation-time path never
     does). CodeRabbit flagged this independently twice reviewing an
     unrelated respawn-guard fix.
-    """
-    from hermes_cli.config import get_config_path
 
-    get_config_path().write_text(
+    The name must be configured under the ASSIGNEE's own profile (profiles
+    are isolated islands, each with its own ``mcp_servers``) — not whatever
+    profile happens to be creating the task.
+    """
+    profile_dir = kanban_home / "profiles" / "worker"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
         "mcp_servers:\n  my_custom_server:\n    command: my-server\n",
         encoding="utf-8",
     )
