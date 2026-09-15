@@ -63,6 +63,16 @@ def _run(outcome="completed", run_id=1, error=None):
     }
 
 
+def _comment(body, ts=None, author="worker", comment_id=1):
+    return {
+        "id": comment_id,
+        "task_id": "t_demo00",
+        "author": author,
+        "body": body,
+        "created_at": int(ts if ts is not None else time.time()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Each rule — positive + negative + clearing
 # ---------------------------------------------------------------------------
@@ -303,3 +313,103 @@ def test_optimization_rule_number_does_not_cross_satisfy_both_fields():
     # (threshold is present here, only baseline is missing).
     assert "savings threshold" not in hits[0].title.lower()
     assert "cost baseline" in hits[0].title.lower()
+
+
+# ---------------------------------------------------------------------------
+# done_action_language_unaddressed
+#
+# A done card whose last comment reads as an unaddressed finding (action
+# language, NO/EN) and which has no child card at all. Flag-only, mirrors
+# _rule_review_intent_untagged's low-intervention level.
+# ---------------------------------------------------------------------------
+
+
+def test_done_action_language_fires_on_english_recommendation_no_children():
+    now = int(time.time())
+    task = _task(status="done")
+    comments = [_comment("Investigation done. I recommend building a follow-up rule for X.", ts=now)]
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=now, comments=comments, graph={"parents": [], "children": []},
+    )
+    hits = [d for d in diags if d.kind == "done_action_language_unaddressed"]
+    assert len(hits) == 1
+    assert hits[0].severity == "warning"
+    assert "recommend" in hits[0].data["matched_text"].lower()
+
+
+def test_done_action_language_fires_on_norwegian_recommendation_no_children():
+    now = int(time.time())
+    task = _task(status="done")
+    comments = [_comment("Funn: dette bør bygges som egen regel senere.", ts=now)]
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=now, comments=comments, graph={"parents": [], "children": []},
+    )
+    hits = [d for d in diags if d.kind == "done_action_language_unaddressed"]
+    assert len(hits) == 1
+
+
+def test_done_action_language_silent_when_child_exists():
+    """A child card already tracks the follow-up — nothing to flag."""
+    now = int(time.time())
+    task = _task(status="done")
+    comments = [_comment("I recommend building a follow-up rule for X.", ts=now)]
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=now, comments=comments,
+        graph={"parents": [], "children": [{"id": "t_child01", "title": "follow-up", "status": "ready"}]},
+    )
+    assert not [d for d in diags if d.kind == "done_action_language_unaddressed"]
+
+
+def test_done_action_language_silent_when_not_done():
+    now = int(time.time())
+    task = _task(status="ready")
+    comments = [_comment("I recommend building a follow-up rule for X.", ts=now)]
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=now, comments=comments, graph={"parents": [], "children": []},
+    )
+    assert not [d for d in diags if d.kind == "done_action_language_unaddressed"]
+
+
+def test_done_action_language_silent_when_last_comment_has_no_action_language():
+    now = int(time.time())
+    task = _task(status="done")
+    comments = [_comment("All good, nothing to report here.", ts=now)]
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=now, comments=comments, graph={"parents": [], "children": []},
+    )
+    assert not [d for d in diags if d.kind == "done_action_language_unaddressed"]
+
+
+def test_done_action_language_only_checks_last_comment():
+    """An action-language finding buried in an EARLIER comment, superseded by
+    a clean final comment, must not fire — only the last comment counts."""
+    now = int(time.time())
+    task = _task(status="done")
+    comments = [
+        _comment("I recommend building X.", ts=now - 100, comment_id=1),
+        _comment("Never mind, closing this out.", ts=now, comment_id=2),
+    ]
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=now, comments=comments, graph={"parents": [], "children": []},
+    )
+    assert not [d for d in diags if d.kind == "done_action_language_unaddressed"]
+
+
+def test_done_action_language_silent_without_comments_or_graph_context():
+    """Missing context (no comments/graph passed) must never fire — the rule
+    would rather under-report than false-positive."""
+    now = int(time.time())
+    task = _task(status="done")
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    assert not [d for d in diags if d.kind == "done_action_language_unaddressed"]
+
+
+def test_done_action_language_can_be_disabled_via_config():
+    now = int(time.time())
+    task = _task(status="done")
+    comments = [_comment("I recommend building a follow-up rule for X.", ts=now)]
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=now, comments=comments, graph={"parents": [], "children": []},
+        config={"done_action_language_pattern": ""},
+    )
+    assert not [d for d in diags if d.kind == "done_action_language_unaddressed"]
