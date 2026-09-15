@@ -734,7 +734,7 @@ def _has_numeric_field_near(
     for m in re.finditer(keyword_pattern, text, re.IGNORECASE):
         start = max(0, m.start() - window)
         end = min(len(text), m.end() + window)
-        for nm in re.finditer(r"\d+(?:\.\d+)?", text[start:end]):
+        for nm in re.finditer(r"(?<!\w)\d+(?:\.\d+)?(?!\w)", text[start:end]):
             abs_start, abs_end = start + nm.start(), start + nm.end()
             dist_this = min(abs(abs_start - m.start()), abs(abs_end - m.end()))
             dist_other = min(
@@ -949,5 +949,6 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "optimization_missing_cost_baseline",
 )
 # ---- END PLUGIN-COMPAT ----
