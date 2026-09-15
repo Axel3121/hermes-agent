@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import json
 import re
+import shlex
 import time
 
 
@@ -833,6 +834,85 @@ def _rule_optimization_missing_cost_baseline(task, events, runs, now, cfg) -> li
     )]
 
 
+# Matches action-language a worker leaves in its LAST comment on a card it
+# then marked done — Norwegian + English. Heuristic by construction (same
+# caveat as REVIEW_INTENT_PATTERN below it in spirit): a done card with no
+# child card tracking the recommendation buries the finding the moment it
+# scrolls off the active board view. Set cfg["done_action_language_pattern"]
+# = "" to disable.
+DONE_ACTION_LANGUAGE_PATTERN = (
+    r"\b(?:anbefaler|recommends?|recommended|flagger|flagget|flags?|flagged|"
+    r"b(?:o|\u00f8)r bygges|should be built|handling(?:s)? p\u00e5krevd|"
+    r"handling needed|action needed)\b"
+)
+
+
+def _rule_done_action_language_unaddressed(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``done`` card whose LAST comment reads as an unaddressed finding
+    (\"anbefaler\", \"recommend\", \"flagger\", \"should be built\", \"action
+    needed\", ...) and which has NO child card at all. Done cards drop out of
+    the active board view, so a finding buried in a closing comment is only
+    ever rediscovered by someone manually querying that exact card — this
+    happened twice independently in one evening (t_e99491e0, t_b3079eb0) with
+    nothing linking the two. Heuristic regex, hence ``warning``; deliberately
+    does NOT create a follow-up card itself — flag only, same low-intervention
+    level as ``_rule_review_intent_untagged``. Requires both ``comments`` and
+    ``graph`` context; either missing means unprovable, so it stays silent
+    rather than risk a false positive."""
+    if _task_field(task, "status") != "done":
+        return []
+    pattern = cfg.get("done_action_language_pattern", DONE_ACTION_LANGUAGE_PATTERN)
+    if not pattern:
+        return []
+
+    graph = cfg.get("_graph")
+    if not isinstance(graph, dict):
+        return []
+    if graph.get("children"):
+        return []  # a child already exists to carry the follow-up.
+
+    comments = cfg.get("_comments")
+    if not comments:
+        return []
+    last_comment = comments[-1]
+    body = str(_task_field(last_comment, "body") or "")
+    if not body.strip():
+        return []
+    match = re.search(pattern, body, re.IGNORECASE)
+    if not match:
+        return []
+
+    task_id = str(_task_field(task, "id") or "")
+    actions: list[DiagnosticAction] = []
+    if task_id:
+        actions.append(_cli_hint(
+            "Create a follow-up card for the recommendation",
+            f"hermes kanban create --parents {shlex.quote(task_id)} --assignee <profile> "
+            f"{shlex.quote('<title>')}",
+            suggested=True,
+        ))
+        actions.append(DiagnosticAction(
+            kind="comment", label="Or note here why no follow-up is needed",
+            payload={"task_id": task_id},
+        ))
+
+    comment_ts = int(_task_field(last_comment, "created_at", default=0) or 0) or int(now)
+    detail_body = body.strip()
+    snippet = detail_body[:300] + ("\u2026" if len(detail_body) > 300 else "")
+    return [Diagnostic(
+        kind="done_action_language_unaddressed", severity="warning",
+        title="Done card's last comment reads as an unaddressed finding",
+        detail="This card is done and has no child card, but its last comment contains "
+               "action language (e.g. 'anbefaler'/'recommend'/'flagger'/'should be built'/"
+               "'action needed') that nothing downstream tracks. Once a card leaves the active "
+               "board view its findings are only found by someone manually querying this exact "
+               "card. Create a follow-up card, or comment here if the finding was a dead end.",
+        actions=actions,
+        first_seen_at=comment_ts, last_seen_at=comment_ts, count=1,
+        data={"matched_text": match.group(0).strip(), "comment_snippet": snippet},
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -845,6 +925,7 @@ _RULES: list[RuleFn] = [
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
     _rule_optimization_missing_cost_baseline,
+    _rule_done_action_language_unaddressed,
 ]
 
 
@@ -910,14 +991,20 @@ def compute_task_diagnostics(
     now: Optional[int] = None,
     config: Optional[dict] = None,
     graph: Optional[dict] = None,
+    comments: Optional[list] = None,
 ) -> list[Diagnostic]:
     """Run every rule for one task; critical first, then error, warning; ties
-    broken by most-recent ``last_seen_at``."""
+    broken by most-recent ``last_seen_at``. ``comments`` is optional context
+    (only ``_rule_done_action_language_unaddressed`` reads it) — omitting it
+    just keeps that one rule silent, same graceful-degradation contract as
+    ``graph``."""
     now_ts = int(now if now is not None else time.time())
     config = config or {}
     cfg = {**DEFAULT_CONFIG, **config}
     if graph is not None:
         cfg["_graph"] = graph
+    if comments is not None:
+        cfg["_comments"] = comments
     if not _has_explicit_threshold(config) and "failure_limit" in config:
         cfg["failure_threshold"] = _positive_int(
             config.get("failure_limit"), DEFAULT_CONFIG["failure_threshold"],
@@ -950,5 +1037,6 @@ DIAGNOSTIC_KINDS = (
     "block_unblock_cycling",
     "stranded_in_ready",
     "optimization_missing_cost_baseline",
+    "done_action_language_unaddressed",
 )
 # ---- END PLUGIN-COMPAT ----
