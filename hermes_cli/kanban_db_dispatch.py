@@ -2182,8 +2182,30 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+# Skills that mark a task as a review/verifier role. A worker dispatched for
+# one of these must not inherit the profile's own MEMORY.md/USER.md/preloaded
+# skills — those can carry the very worker's self-report or bias forward from
+# earlier same-profile work, collapsing the independence a verifier exists to
+# provide (see the kanban-independent-verification skill). This tag list is
+# intentionally not a DB column: both names are already-real, already-used
+# skill identifiers, so `task.skills` doubles as the mechanism with no schema
+# change.
+REVIEW_TAG_SKILLS = frozenset({"kanban-independent-verification", "requesting-code-review"})
+
+
+def _is_review_tagged(task: Task) -> bool:
+    """True if this task's forced skills mark it as a review/verifier role."""
+    return any(sk in REVIEW_TAG_SKILLS for sk in (task.skills or ()))
+
+
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command.
+
+    ``task.toolsets_override`` is narrowing-only: it is intersected with the
+    assignee profile's configured CLI toolsets and can never grant a toolset the
+    profile does not already have. Task lifecycle tools remain independently
+    available through ``HERMES_KANBAN_TASK``.
+    """
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
@@ -2195,6 +2217,12 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
         # configured hooks still register.
         "--accept-hooks",
     ]
+    if _is_review_tagged(task):
+        # Isolation, not evidence-forcing: skip MEMORY.md/USER.md/profile
+        # preloaded-skill injection so a same-profile verifier judges the
+        # artifact fresh instead of inheriting the worker's own framing.
+        # --skills below still force-loads this task's own review skill.
+        cmd.append("--ignore-rules")
     # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
     # ambiguity if a skill name contains unusual chars.
     for sk in task.skills or ():
@@ -2204,14 +2232,42 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
         cmd.extend(["-m", task.model_override])
         # Pin the provider too so the worker resolves the model against the
         # intended backend (model X with provider Y is the classic board-stall).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
+        # A model_override with no provider_override must NOT spawn with a bare
+        # `-m` and let the worker's environment supply whatever provider it
+        # currently defaults to (t_04509175: `set-model claude-sonnet-5` with no
+        # `--provider` inherited openai-codex and died before the first model
+        # turn, 10 times, across two tasks). Fall back to a static-catalog guess
+        # for the model's owning provider; this self-heals rows stored before
+        # this fix, at the cost of leaving truly unrecognized model names
+        # (typos, not-yet-cataloged ids) with the old bare-`-m` behavior, which
+        # the worker's own startup guard already reports clearly.
+        provider = task.provider_override
+        if not provider:
+            try:
+                from hermes_cli.models import detect_static_provider_for_model
+                detected = detect_static_provider_for_model(task.model_override, "auto")
+            except Exception:
+                detected = None
+            if detected:
+                provider = detected[0]
+        if provider:
+            cmd.extend(["--provider", provider])
     # Independent of the model override — a task can run the profile's own
     # model at a different depth.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
-    if worker_toolsets:
+    if task.toolsets_override is not None:
+        # Never widen a profile: this task-level field can only scope its
+        # configured toolsets down, never add an independently requested one.
+        worker_toolsets = (
+            sorted(set(worker_toolsets or []) & set(task.toolsets_override))
+            if task.toolsets_override else []
+        )
+    # An explicit empty argument is distinct from no argument: the latter
+    # reloads the profile defaults, while the former preserves an empty
+    # intersection and leaves only task-scoped lifecycle tools.
+    if worker_toolsets is not None:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
     if task.goal_mode:

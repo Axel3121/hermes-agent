@@ -365,6 +365,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+            toolsets_override=getattr(args, "toolsets_override", None) or None,
             max_retries=max_retries, model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
@@ -525,7 +526,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph, comments=comments)
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -594,6 +595,20 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_set_toolsets(args: argparse.Namespace) -> int:
+    toolsets = list(getattr(args, "toolsets", ()) or ())
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.set_toolsets_override(conn, args.task_id, toolsets)
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    label = ", ".join(toolsets) if toolsets else "none"
+    print(f"Set toolsets override on {args.task_id}: {label} (narrowing-only; applies on next dispatch)")
+    return 0
+
+
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
@@ -642,7 +657,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 return _err(f"no such task: {args.task}")
             diags_by_task = {args.task: kd.compute_task_diagnostics(
                 task, kb.list_events(conn, args.task), kb.list_runs(conn, args.task),
-                graph=kb.task_graph_context(conn, args.task), config=diag_config)}
+                graph=kb.task_graph_context(conn, args.task), config=diag_config,
+                comments=kb.list_comments(conn, args.task))}
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall())
@@ -652,10 +668,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 ev_by = _rows_by_task(conn, "task_events", ids)
                 run_by = _rows_by_task(conn, "task_runs", ids)
                 graph_by = kb.task_graph_contexts(conn, ids)
+                comment_by = _rows_by_task(conn, "task_comments", ids)
                 for r in rows:
                     tid = r["id"]
                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),
-                                                     graph=graph_by.get(tid), config=diag_config)
+                                                     graph=graph_by.get(tid), config=diag_config,
+                                                     comments=comment_by.get(tid, []))
                     if dl:
                         diags_by_task[tid] = dl
 
@@ -1248,7 +1266,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
-    "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "assign": _cmd_assign, "set-model": _cmd_set_model, "set-toolsets": _cmd_set_toolsets,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
