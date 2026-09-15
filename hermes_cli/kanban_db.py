@@ -1226,17 +1226,38 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _configured_mcp_server_names() -> set[str]:
+    """Names configured under ``mcp_servers`` in the active config.yaml.
+
+    A static-toolset check alone rejects a valid MCP-server-named override
+    (e.g. ``--toolsets my-custom-server``): MCP server names only resolve as
+    toolsets after ``discover_mcp_tools`` runs, which this validation-time
+    path never does. Mirrors the same allowance ``cli.py``'s own unknown-
+    toolset warning already makes. Best-effort: an unreadable/missing config
+    must not block task creation, so this degrades to an empty set.
+    """
+    try:
+        from hermes_cli.config import load_config
+        return set((load_config().get("mcp_servers") or {}).keys())
+    except Exception:
+        _log.debug("could not resolve configured mcp_servers for toolset validation", exc_info=True)
+        return set()
+
+
 def _normalize_task_toolsets(toolsets: Optional[Iterable[str]]) -> Optional[list[str]]:
     """Strip/dedupe known toolsets for a narrowing-only task override.
 
     This validates names, not permissions: dispatch intersects the stored list
     with the assignee profile's configured toolsets, so a task can never widen
-    profile access.
+    profile access. A name is accepted when it is either a known static/plugin
+    toolset OR a server named under the active config's ``mcp_servers`` —
+    anything else is still rejected.
     """
     if toolsets is None:
         return None
     cleaned: list[str] = []
     seen: set[str] = set()
+    mcp_names: Optional[set[str]] = None
     for value in toolsets:
         if not value:
             continue
@@ -1249,7 +1270,10 @@ def _normalize_task_toolsets(toolsets: Optional[Iterable[str]]) -> Optional[list
                 "(pass separate toolset names instead of a comma-joined string)"
             )
         if not validate_toolset(name):
-            raise ValueError(f"unknown toolset: {name!r}")
+            if mcp_names is None:
+                mcp_names = _configured_mcp_server_names()
+            if name not in mcp_names:
+                raise ValueError(f"unknown toolset: {name!r}")
         key = name.casefold()
         if key in seen:
             continue
